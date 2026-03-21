@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 .ground_truth.json
 sentinel_alerts.jsonl
+telemetry_requests.json
+telemetry_requests_log.jsonl

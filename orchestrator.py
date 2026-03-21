@@ -292,6 +292,22 @@ if __name__ == "__main__":
         # Step 4: Check for errors
         if "error" in detection_output and detection_output["error"]:
             print(f"[!] Error: {detection_output['error']}")
+
+            # Telemetry Engineer: analyze if this looks like a data gap
+            error_text = detection_output["error"] + "\n" + detection_output.get("stderr", "")
+            try:
+                from telemetry_engineer import check_hunt_iteration
+                tel_requests = check_hunt_iteration(
+                    error_text=error_text,
+                    detect_code=new_code,
+                    channels=["console", "file"],
+                    hunt_context=f"Hunt iteration {iteration}, prompt: {HUNT_PROMPT_PATH}",
+                )
+                if tel_requests:
+                    print(f"[*] Telemetry Engineer created {len(tel_requests)} observability request(s)")
+            except Exception:
+                pass  # Telemetry Engineer is optional
+
             feedback_context = (
                 f"ITERATION {iteration} RESULT:\n"
                 f"Your detect.py CRASHED with error:\n{detection_output['error']}\n"

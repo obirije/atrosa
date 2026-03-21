@@ -59,7 +59,7 @@ Inspired by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) 
 | **Cartographer** | Ingests fragmented telemetry into queryable DataFrames | MVP |
 | **Hunter** | AI agent that writes & proves detection scripts iteratively | MVP |
 | **Sentinel** | Executes graduated rules against live streams, triggers mitigation | MVP |
-| **Telemetry Engineer** | Requests missing observability when a hunt stalls | Planned |
+| **Telemetry Engineer** | Detects data gaps, generates observability requests for DevOps | MVP |
 
 ## How the Hunter Loop Works
 
@@ -185,6 +185,7 @@ cat sentinel_alerts.jsonl     # Alerts triggered by the Sentinel
 atrosa/
 ├── orchestrator.py          # Hunter loop controller — drives the AI agent
 ├── sentinel.py              # Sentinel swarm — live stream monitor & response
+├── telemetry_engineer.py    # Active observability — detects data gaps
 ├── providers.py             # Multi-LLM provider abstraction
 ├── hunt.md                  # System prompt for the Hunter LLM
 ├── detect.py                # The file the Hunter iteratively rewrites
@@ -316,6 +317,73 @@ Every detection produces a structured alert:
   "execution_time_ms": 45
 }
 ```
+
+## Telemetry Engineer (Active Observability)
+
+The feedback loop. When a Hunter can't prove a hypothesis because the data is incomplete, the Telemetry Engineer identifies exactly what's missing and generates actionable requests for your DevOps team.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│              TELEMETRY ENGINEER                           │
+│                                                          │
+│  Audit Mode          Error Analysis       Request Mgmt   │
+│  ┌────────────┐     ┌──────────────┐     ┌───────────┐  │
+│  │ Compare     │     │ Parse Hunter │     │ Track     │  │
+│  │ schema vs   │     │ errors for   │     │ open /    │  │
+│  │ ideal       │     │ data gaps    │     │ resolved  │  │
+│  └──────┬─────┘     └──────┬───────┘     └───────────┘  │
+│         │                  │                             │
+│         ▼                  ▼                             │
+│  ┌─────────────────────────────────────┐                 │
+│  │          Delivery Channels          │                 │
+│  │  Console • Slack • GitHub • Jira    │                 │
+│  └─────────────────────────────────────┘                 │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Usage
+
+```bash
+# Audit telemetry against the ideal fintech schema
+python telemetry_engineer.py audit
+
+# Analyze a specific Hunter error
+python telemetry_engineer.py analyze --error "KeyError: 'jwt_claims'"
+
+# Analyze with full context from iteration logs
+python telemetry_engineer.py analyze --hunt-log logs/iteration_03.py --error-log logs/error_03.txt
+
+# Check status of all observability requests
+python telemetry_engineer.py status
+
+# Mark a request as resolved (after DevOps enables the logging)
+python telemetry_engineer.py resolve TEL-REQ-A1B2C3
+
+# Deliver requests to Slack and GitHub Issues
+python telemetry_engineer.py audit --channel slack --channel github
+```
+
+### How it works
+
+**Schema Audit** compares your actual telemetry against an ideal fintech schema covering 50+ fields across all 4 sources. It flags:
+- **Critical**: Entire log source missing
+- **High**: Required fields missing
+- **Medium**: Required fields >50% null (sparse data)
+- **Low**: Recommended fields missing (limits future threat classes)
+
+**Error Analysis** parses Hunter crash output and detection code to identify specific data gaps — e.g., if the Hunter tried to access `jwt_claims` and got a `KeyError`, the Telemetry Engineer creates an urgent request to enable JWT logging on the API gateway.
+
+**Orchestrator Integration** — the Telemetry Engineer is automatically invoked when a Hunter iteration crashes. No manual intervention needed.
+
+### Delivery Channels
+
+| Channel | Env Variable | What it does |
+|---------|-------------|-------------|
+| `console` | — | Print to terminal (default) |
+| `file` | — | Append to `telemetry_requests_log.jsonl` |
+| `slack` | `TELEMETRY_SLACK_WEBHOOK` | Send formatted message to Slack |
+| `github` | `TELEMETRY_GITHUB_REPO` | Create GitHub Issue with labels |
+| `jira` | `TELEMETRY_JIRA_URL`, `_TOKEN`, `_PROJECT` | Create Jira ticket with priority |
 
 ## Extending ATROSA
 
