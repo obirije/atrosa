@@ -98,7 +98,7 @@ Inspired by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) 
 ## Quickstart
 
 ```bash
-git clone https://github.com/AudiSense-R-D/atrosa.git
+git clone https://github.com/obirije/atrosa.git
 cd atrosa
 
 python -m venv .venv
