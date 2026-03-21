@@ -1,0 +1,19 @@
+{
+  "rules": [
+    {
+      "rule_id": "FIN-RACE-1934C9",
+      "threat_hypothesis": "Double-spend via webhook desync: CREDIT without matching DEBIT after forced network disconnect",
+      "required_telemetry": [
+        "api_gateway",
+        "mobile_client_errors",
+        "ledger_db_commits",
+        "payment_webhooks"
+      ],
+      "detection_logic_file": "rules/fin_race_1934c9.py",
+      "mitigation_action": "suspend_user_id_and_flag_ledger",
+      "confidence_score": 1.0,
+      "graduated_at": "2026-03-21T21:44:32.656009",
+      "iterations_to_prove": 1
+    }
+  ]
+}

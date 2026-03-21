@@ -1,0 +1,4 @@
+pandas>=2.0
+anthropic>=0.80
+openai>=1.0
+google-genai>=1.0
