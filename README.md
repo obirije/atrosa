@@ -32,26 +32,32 @@ Inspired by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        ATROSA SWARM                              │
-│                                                                  │
-│  ┌─────────────┐    ┌──────────────┐    ┌──────────────────┐    │
-│  │ CARTOGRAPHER │───▶│ HUNTER SWARM │───▶│  SENTINEL SWARM  │    │
-│  │  (Ingest)    │    │  (Detect)    │    │  (Enforce)       │    │
-│  │              │    │              │    │                  │    │
-│  │ API gateway  │    │ Hypothesize  │    │ Execute proven   │    │
-│  │ Ledger DB    │    │ Write code   │    │ rules against    │    │
-│  │ Mobile logs  │    │ Test & score │    │ live streams     │    │
-│  │ Webhooks     │    │ Iterate      │    │ Trigger response │    │
-│  └─────────────┘    │ Graduate     │    └──────────────────┘    │
-│                      └──────┬───────┘                            │
-│                             │                                    │
-│                      ┌──────▼───────┐                            │
-│                      │  TELEMETRY   │                            │
-│                      │  ENGINEER    │                            │
-│                      │  (Feedback)  │                            │
-│                      └──────────────┘                            │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                          ATROSA SWARM                                │
+│                                                                      │
+│  ┌─────────────┐    ┌──────────────┐    ┌──────────────────┐        │
+│  │ CARTOGRAPHER │───▶│ HUNTER SWARM │───▶│  SENTINEL SWARM  │        │
+│  │  (Ingest)    │    │  (Detect)    │    │  (Enforce)       │        │
+│  │              │    │              │    │                  │        │
+│  │ API gateway  │    │ Hypothesize  │    │ Execute proven   │        │
+│  │ Ledger DB    │    │ Write code   │    │ rules against    │        │
+│  │ Mobile logs  │    │ Test & score │    │ live streams     │        │
+│  │ Webhooks     │    │ Iterate      │    │ Trigger response │        │
+│  └──────▲──────┘    │ Graduate     │    └──────────────────┘        │
+│         │           └──────┬───────┘                                │
+│         │                  │ Hunt blocked?                           │
+│         │           ┌──────▼───────────────┐                        │
+│         │           │  TELEMETRY ENGINEER   │                        │
+│         │           │  (Active Observability)│                        │
+│         │           │                       │                        │
+│         │           │  Detect data gaps     │ ──▶ Slack / Jira /    │
+│         │           │  Audit schema         │     GitHub Issues     │
+│         │           │  Track requests       │                        │
+│         │           └──────┬───────────────┘                        │
+│         │                  │ Gap resolved                            │
+│         └──────────────────┘                                        │
+│              Enriched telemetry feeds next hunt                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 | Swarm | Role | Status |
@@ -171,7 +177,19 @@ python sentinel.py --interval 0 --batch-size 1000
 python sentinel.py --dry-run
 ```
 
-### 5. Inspect results
+### 5. Audit telemetry coverage
+
+```bash
+# Check what data gaps exist in your telemetry
+python telemetry_engineer.py audit
+
+# See all open observability requests
+python telemetry_engineer.py status
+```
+
+The Telemetry Engineer also fires automatically when Hunter iterations crash due to missing data — no manual step needed.
+
+### 6. Inspect results
 
 ```bash
 cat active_rules.json        # Graduated rule metadata
@@ -244,7 +262,15 @@ Results from the first end-to-end run on synthetic telemetry:
 | Avg rule execution | ~35ms per batch |
 | False positives | 0 |
 
-The Hunter writes the rule; the Sentinel runs it at production speed. No LLM in the enforcement path.
+**Telemetry Engineer (Schema Audit)**
+| Metric | Result |
+|--------|--------|
+| Fields audited | 50+ across 4 sources |
+| Gaps detected | 43 (4 medium, 39 recommended) |
+| Critical gaps | 0 (all required sources present) |
+| Requests generated | 43 with actionable DevOps instructions |
+
+The Hunter writes the rule; the Sentinel runs it at production speed; the Telemetry Engineer closes the feedback loop. No LLM in the enforcement path.
 
 ## Sentinel Swarm (Live Enforcement)
 
@@ -432,6 +458,7 @@ Modify `ingest.py:score_detections()` to match your environment. The current sco
 - **Deterministic execution**: No LLM in the hot path. Graduated rules are pure Python running against DataFrames.
 - **Iterative proof**: Rules aren't deployed on vibes. They must achieve a perfect SNR score against historical data before graduation.
 - **Separation of concerns**: Heavy LLM compute (Hunter) is decoupled from sub-second production execution (Sentinel).
+- **Closed feedback loop**: The Telemetry Engineer ensures hunts are never permanently blocked by missing data — it identifies gaps, requests fixes, and tracks resolution.
 
 ## Supported Providers
 
