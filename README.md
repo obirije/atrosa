@@ -101,7 +101,9 @@ Inspired by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) 
 - **Score = 100**: Isolated exactly the anomalous events with zero false positives
 - Partial credit for partial matches, weighted by recall and precision
 
-## Quickstart
+## Installation
+
+### Python (pip)
 
 ```bash
 git clone https://github.com/obirije/atrosa.git
@@ -109,10 +111,22 @@ cd atrosa
 
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 ```
 
-### 1. Set your API key
+This gives you the `atrosa` CLI command.
+
+### Node.js (npm)
+
+```bash
+cd atrosa/node
+npm install
+npm run build
+```
+
+Then use `npx atrosa` or `node dist/bin/atrosa.js`. Note: the Node.js CLI still requires Python installed for executing detection scripts.
+
+### API Keys
 
 ```bash
 # Pick ONE — whichever provider you want to use:
@@ -123,36 +137,37 @@ export OPENROUTER_API_KEY="sk-or-..."       # OpenRouter
 # Local models (Ollama, LM Studio) need no key
 ```
 
-### 2. Generate synthetic telemetry
+## Quickstart
+
+### 1. Generate synthetic telemetry
 
 ```bash
-python mock_telemetry.py
+atrosa init
 ```
 
 Creates a 24-hour fintech dataset (~26,000 events across 4 sources) with 3 hidden double-spend anomalies injected.
 
-### 3. Run the Hunter
+### 2. Run the Hunter
 
 ```bash
 # Default: Anthropic Claude Sonnet
-python orchestrator.py
+atrosa hunt
 
 # OpenAI
-python orchestrator.py --provider openai
-python orchestrator.py --provider openai --model gpt-4.1
+atrosa hunt --provider openai
+atrosa hunt --provider openai --model gpt-4.1
 
 # Google Gemini
-python orchestrator.py --provider gemini
-python orchestrator.py --provider gemini --model gemini-2.5-pro
+atrosa hunt --provider gemini
 
 # OpenRouter (access 100+ models)
-python orchestrator.py --provider openrouter --model google/gemini-2.5-pro
+atrosa hunt --provider openrouter --model google/gemini-2.5-pro
 
 # Local models (Ollama)
-python orchestrator.py --provider local --model qwen2.5-coder:14b
+atrosa hunt --provider local --model qwen2.5-coder:14b
 
 # Local models (LM Studio / vLLM)
-python orchestrator.py --provider local --model deepseek-coder-v2 --base-url http://localhost:1234/v1
+atrosa hunt --provider local --model deepseek-coder-v2 --base-url http://localhost:1234/v1
 ```
 
 The orchestrator will:
@@ -164,32 +179,32 @@ The orchestrator will:
 6. Feed the score back for iteration
 7. Graduate the rule on a perfect score
 
-### 4. Run the Sentinel (live enforcement)
+### 3. Run the Sentinel (live enforcement)
 
 ```bash
 # Simulate a live stream by replaying telemetry in batches
-python sentinel.py
+atrosa sentinel
 
 # Fast replay with smaller batches
-python sentinel.py --interval 0 --batch-size 1000
+atrosa sentinel --interval 0 --batch-size 1000
 
 # Dry run — detect but skip mitigation
-python sentinel.py --dry-run
+atrosa sentinel --dry-run
 ```
 
-### 5. Audit telemetry coverage
+### 4. Audit telemetry coverage
 
 ```bash
 # Check what data gaps exist in your telemetry
-python telemetry_engineer.py audit
+atrosa telemetry audit
 
 # See all open observability requests
-python telemetry_engineer.py status
+atrosa telemetry status
 ```
 
 The Telemetry Engineer also fires automatically when Hunter iterations crash due to missing data — no manual step needed.
 
-### 6. Inspect results
+### 5. Inspect results
 
 ```bash
 cat active_rules.json        # Graduated rule metadata
@@ -201,20 +216,30 @@ cat sentinel_alerts.jsonl     # Alerts triggered by the Sentinel
 
 ```
 atrosa/
-├── orchestrator.py          # Hunter loop controller — drives the AI agent
-├── sentinel.py              # Sentinel swarm — live stream monitor & response
-├── telemetry_engineer.py    # Active observability — detects data gaps
-├── providers.py             # Multi-LLM provider abstraction
+├── src/atrosa/              # Python package (pip install -e .)
+│   ├── cli.py               # CLI entry point — `atrosa` command
+│   ├── orchestrator.py      # Hunter loop controller
+│   ├── sentinel.py          # Live stream monitor & response
+│   ├── telemetry_engineer.py# Active observability agent
+│   ├── providers.py         # Multi-LLM provider abstraction
+│   ├── ingest.py            # Data loading + SNR scoring harness
+│   └── mock_telemetry.py    # Synthetic telemetry generator
+├── node/                    # Node.js/TypeScript CLI
+│   ├── src/
+│   │   ├── cli.ts           # Commander.js entry point
+│   │   ├── commands/        # hunt, sentinel, telemetry, init
+│   │   ├── providers/       # Anthropic, OpenAI, Gemini, local
+│   │   ├── engine/          # Ingest, scoring, rule engine
+│   │   ├── telemetry/       # Gap analyzer, requests, delivery
+│   │   └── mock/            # Synthetic data generator
+│   └── package.json
+├── pyproject.toml           # Python package config
 ├── hunt.md                  # System prompt for the Hunter LLM
 ├── detect.py                # The file the Hunter iteratively rewrites
-├── ingest.py                # Data loading + SNR scoring harness
-├── mock_telemetry.py        # Synthetic fintech telemetry generator
 ├── active_rules.json        # Graduated rule registry
 ├── rules/                   # Proven detection scripts
-│   └── fin_race_*.py
 ├── logs/                    # Iteration logs (code + scores per run)
-├── data/                    # Generated telemetry (gitignored)
-└── requirements.txt
+└── data/                    # Generated telemetry (gitignored)
 ```
 
 ## Example: Graduated Rule
@@ -301,16 +326,16 @@ Once the Hunter graduates a rule, the Sentinel executes it against live data str
 
 ```bash
 # Simulated mode — replays mock telemetry as a live stream
-python sentinel.py
+atrosa sentinel
 
 # With custom batch interval
-python sentinel.py --interval 5
+atrosa sentinel --interval 5
 
-# Watch mode — tail a JSONL file for new events
-python sentinel.py --mode watch --watch-dir /var/log/fintech/
+# Watch mode — tail a directory for new events
+atrosa sentinel --mode watch --watch-dir /var/log/fintech/
 
 # Dry run — detect but don't execute mitigation actions
-python sentinel.py --dry-run
+atrosa sentinel --dry-run
 ```
 
 ### Mitigation Actions
@@ -371,22 +396,22 @@ The feedback loop. When a Hunter can't prove a hypothesis because the data is in
 
 ```bash
 # Audit telemetry against the ideal fintech schema
-python telemetry_engineer.py audit
+atrosa telemetry audit
 
 # Analyze a specific Hunter error
-python telemetry_engineer.py analyze --error "KeyError: 'jwt_claims'"
+atrosa telemetry analyze --error "KeyError: 'jwt_claims'"
 
 # Analyze with full context from iteration logs
-python telemetry_engineer.py analyze --hunt-log logs/iteration_03.py --error-log logs/error_03.txt
+atrosa telemetry analyze --hunt-log logs/iteration_03.py --error-log logs/error_03.txt
 
 # Check status of all observability requests
-python telemetry_engineer.py status
+atrosa telemetry status
 
 # Mark a request as resolved (after DevOps enables the logging)
-python telemetry_engineer.py resolve TEL-REQ-A1B2C3
+atrosa telemetry resolve TEL-REQ-A1B2C3
 
 # Deliver requests to Slack and GitHub Issues
-python telemetry_engineer.py audit --channel slack --channel github
+atrosa telemetry audit --channel slack --channel github
 ```
 
 ### How it works
@@ -426,7 +451,7 @@ without completing all required KYC steps...
 Then point the orchestrator at it:
 
 ```bash
-python orchestrator.py --hunt-prompt hunt_kyc_bypass.md
+atrosa hunt --hunt-prompt hunt_kyc_bypass.md
 ```
 
 ### Adding real telemetry
@@ -473,28 +498,33 @@ Modify `ingest.py:score_detections()` to match your environment. The current sco
 Override the default model with `--model`:
 
 ```bash
-python orchestrator.py --provider openai --model gpt-4.1
-python orchestrator.py --provider local --model llama3.3:70b
+atrosa hunt --provider openai --model gpt-4.1
+atrosa hunt --provider local --model llama3.3:70b
 ```
 
 For local models, set a custom endpoint with `--base-url`:
 
 ```bash
 # Ollama (default)
-python orchestrator.py --provider local
+atrosa hunt --provider local
 
 # LM Studio
-python orchestrator.py --provider local --base-url http://localhost:1234/v1
+atrosa hunt --provider local --base-url http://localhost:1234/v1
 
 # vLLM
-python orchestrator.py --provider local --base-url http://localhost:8000/v1
+atrosa hunt --provider local --base-url http://localhost:8000/v1
 ```
 
 ## Requirements
 
+**Python CLI:**
 - Python 3.12+
 - At least one LLM provider (API key or local model server)
-- pandas
+
+**Node.js CLI:**
+- Node.js 18+
+- Python 3.12+ (for executing detection scripts)
+- At least one LLM provider
 
 ## License
 

@@ -1,0 +1,26 @@
+{
+  "name": "atrosa",
+  "version": "0.1.0",
+  "description": "ATROSA — Autonomous Threat Research & Offensive Security Agent (Node.js CLI)",
+  "type": "module",
+  "bin": {
+    "atrosa": "./dist/bin/atrosa.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx bin/atrosa.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@google/generative-ai": "^0.24.0",
+    "commander": "^13.1.0",
+    "openai": "^4.85.0",
+    "seedrandom": "^3.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "@types/seedrandom": "^3.0.8",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

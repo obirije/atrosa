@@ -7,3 +7,6 @@ __pycache__/
 sentinel_alerts.jsonl
 telemetry_requests.json
 telemetry_requests_log.jsonl
+node/node_modules/
+node/dist/
+*.egg-info/
