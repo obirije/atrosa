@@ -10,3 +10,6 @@ telemetry_requests_log.jsonl
 node/node_modules/
 node/dist/
 *.egg-info/
+paper_fraud_landscape.md
+tenants/
+audit/

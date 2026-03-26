@@ -45,6 +45,10 @@ DETECT_PATH = Path("detect.py")
 RULES_PATH = Path("active_rules.json")
 LOG_DIR = Path("logs")
 
+# Production scoring + audit (imported lazily to avoid circular deps)
+_audit_trail = None
+_production_scorer = None
+
 # ===========================
 # LLM INTERFACE
 # ===========================
@@ -181,8 +185,11 @@ def graduate_rule(detect_code: str, score_result: dict, iteration: int):
 # ===========================
 # MAIN LOOP
 # ===========================
-def run_hunt(provider_name: str = "anthropic", model: str = None, base_url: str = None):
+def run_hunt(provider_name: str = "anthropic", model: str = None, base_url: str = None,
+             tenant_id: str = "default", production: bool = False, hunt_id: str = None):
     """Main Hunter iteration loop."""
+    global _audit_trail, _production_scorer
+
     print("=" * 60)
     print("  ATROSA — Hunter Swarm Orchestrator")
     print("=" * 60)
@@ -199,11 +206,43 @@ def run_hunt(provider_name: str = "anthropic", model: str = None, base_url: str 
     ground_truth = harness["ground_truth"]
     total_events = harness["total_events"]
 
+    # Initialize audit trail
+    try:
+        from audit import AuditTrail
+        _audit_trail = AuditTrail(tenant_id=tenant_id)
+        hunt_run_id = f"{hunt_id or 'hunt'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        _audit_trail.start_hunt(
+            hunt_id=hunt_run_id,
+            prompt_path=str(HUNT_PROMPT_PATH),
+            provider=provider_name,
+            model=model or DEFAULT_MODELS.get(provider_name, "default"),
+            data_version=hashlib.sha256(str(total_events).encode()).hexdigest()[:8],
+            schema_info="\n".join(schema_info) if 'schema_info' in dir() else "",
+        )
+        print(f"[*] Audit trail initialized: {hunt_run_id}")
+    except Exception as e:
+        print(f"[*] Audit trail unavailable: {e}")
+        _audit_trail = None
+
+    # Initialize production scorer if in production mode
+    if production:
+        try:
+            from scoring import ProductionScorer
+            _production_scorer = ProductionScorer(config={
+                "max_flag_rate": 0.001,  # 0.1% — production threshold
+                "graduation_threshold": 70,
+            })
+            print("[*] Production scoring enabled (no ground truth required)")
+        except Exception as e:
+            print(f"[!] Production scorer unavailable: {e}")
+            _production_scorer = None
+
     # Initialize LLM
     display_model = model or DEFAULT_MODELS.get(provider_name, "default")
     print(f"\n[*] Initializing Hunter LLM agent...")
     print(f"    Provider: {provider_name}")
     print(f"    Model: {display_model}")
+    print(f"    Mode: {'production' if production else 'development'}")
     if base_url:
         print(f"    Base URL: {base_url}")
     hunter = HunterLLM(provider_name=provider_name, model=model, base_url=base_url)
@@ -326,12 +365,23 @@ if __name__ == "__main__":
 
         print(f"[*] Flagged: {len(flagged_tx)} transactions, {len(flagged_users)} users")
 
-        score_result = ingest.score_detections(
-            flagged_tx_ids=flagged_tx,
-            flagged_user_ids=flagged_users,
-            total_events=total_events,
-            ground_truth=ground_truth,
-        )
+        # Use production scorer if available, otherwise use ground truth
+        if _production_scorer and production:
+            data = {
+                "api": harness["df_api"], "db": harness["df_db"],
+                "mobile": harness["df_mobile"], "webhooks": harness["df_webhooks"],
+            }
+            score_result = _production_scorer.score_for_autoresearch(
+                flagged_tx_ids=flagged_tx, flagged_user_ids=flagged_users,
+                total_events=total_events, data=data, ground_truth=None,
+            )
+        else:
+            score_result = ingest.score_detections(
+                flagged_tx_ids=flagged_tx,
+                flagged_user_ids=flagged_users,
+                total_events=total_events,
+                ground_truth=ground_truth,
+            )
 
         score = score_result["score"]
         print(f"[*] SNR Score: {score}/100")
@@ -349,10 +399,30 @@ if __name__ == "__main__":
         with open(LOG_DIR / f"score_{iteration:02d}.json", "w") as f:
             json.dump(score_log, f, indent=2)
 
+        # Log to audit trail
+        if _audit_trail:
+            try:
+                _audit_trail.log_iteration(
+                    iteration=iteration, code=new_code, score=score,
+                    feedback=score_result["feedback"],
+                    execution_time_s=elapsed,
+                    flagged_tx_count=len(flagged_tx),
+                    flagged_user_count=len(flagged_users),
+                )
+            except Exception:
+                pass
+
         # Step 6: Check for graduation
-        if score == 100:
-            print("\n[!!!] PERFECT SCORE — GRADUATING RULE")
+        graduation_score = 100 if not production else score_result.get("graduation_threshold", 70)
+        should_graduate = score >= graduation_score if production else score == 100
+        if should_graduate:
+            print(f"\n[!!!] {'PERFECT SCORE' if score == 100 else f'SCORE {score} >= {graduation_score}'} — GRADUATING RULE")
             rule_id = graduate_rule(new_code, score_result, iteration)
+            if _audit_trail:
+                try:
+                    _audit_trail.graduate_rule(rule_id, new_code, score_result)
+                except Exception:
+                    pass
             print(f"\n[+] Hunt complete. Rule {rule_id} is now active.")
             return True
 
@@ -423,6 +493,21 @@ Examples:
         default=str(HUNT_PROMPT_PATH),
         help=f"Path to hunt prompt file (default: {HUNT_PROMPT_PATH})",
     )
+    parser.add_argument(
+        "--tenant", "-t",
+        default="default",
+        help="Tenant ID for multi-customer deployment (default: default)",
+    )
+    parser.add_argument(
+        "--production",
+        action="store_true",
+        help="Enable production mode (ground-truth-free scoring, temperature=0, audit trail)",
+    )
+    parser.add_argument(
+        "--hunt-id",
+        default=None,
+        help="Hunt category ID from hunt_catalog (e.g. webhook_desync, sim_swap_ato)",
+    )
     return parser.parse_args()
 
 
@@ -433,5 +518,8 @@ if __name__ == "__main__":
         provider_name=args.provider,
         model=args.model,
         base_url=args.base_url,
+        tenant_id=args.tenant,
+        production=args.production,
+        hunt_id=args.hunt_id,
     )
     sys.exit(0 if success else 1)

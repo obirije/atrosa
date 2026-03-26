@@ -4,7 +4,7 @@
 
 An agentic cybersecurity platform that hunts for financial business logic flaws — the kind structural scanners miss. ATROSA uses an AI-driven iterative loop to hypothesize, write, test, and prove detection rules against real telemetry, then graduates those rules for live production enforcement.
 
-Built for fintech, banking, and payments infrastructure.
+Built for fintech, banking, insurance, lending, and payments infrastructure.
 
 ![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
@@ -216,30 +216,27 @@ cat sentinel_alerts.jsonl     # Alerts triggered by the Sentinel
 
 ```
 atrosa/
-├── src/atrosa/              # Python package (pip install -e .)
-│   ├── cli.py               # CLI entry point — `atrosa` command
-│   ├── orchestrator.py      # Hunter loop controller
-│   ├── sentinel.py          # Live stream monitor & response
-│   ├── telemetry_engineer.py# Active observability agent
-│   ├── providers.py         # Multi-LLM provider abstraction
-│   ├── ingest.py            # Data loading + SNR scoring harness
-│   └── mock_telemetry.py    # Synthetic telemetry generator
-├── node/                    # Node.js/TypeScript CLI
-│   ├── src/
-│   │   ├── cli.ts           # Commander.js entry point
-│   │   ├── commands/        # hunt, sentinel, telemetry, init
-│   │   ├── providers/       # Anthropic, OpenAI, Gemini, local
-│   │   ├── engine/          # Ingest, scoring, rule engine
-│   │   ├── telemetry/       # Gap analyzer, requests, delivery
-│   │   └── mock/            # Synthetic data generator
-│   └── package.json
-├── pyproject.toml           # Python package config
-├── hunt.md                  # System prompt for the Hunter LLM
+├── orchestrator.py          # Hunter loop controller (dev + production modes)
+├── sentinel.py              # Live stream monitor & response
+├── ingest.py                # Data loading + SNR scoring harness
 ├── detect.py                # The file the Hunter iteratively rewrites
+├── providers.py             # Multi-LLM provider abstraction
+├── mock_telemetry.py        # Synthetic telemetry generator
+├── telemetry_engineer.py    # Active observability agent
+├── scoring.py               # Production scoring (4 strategies, no ground truth needed)
+├── schema_normalizer.py     # Customer schema mapping + auto-discovery
+├── hunt_catalog.py          # 25 hunt category definitions + prompt templates
+├── audit.py                 # Rule provenance + SAR report generation
+├── tenant.py                # Multi-tenant config + tier resolution
+├── hunt.md                  # System prompt for the Hunter LLM
 ├── active_rules.json        # Graduated rule registry
 ├── rules/                   # Proven detection scripts
 ├── logs/                    # Iteration logs (code + scores per run)
-└── data/                    # Generated telemetry (gitignored)
+├── data/                    # Generated telemetry (gitignored)
+├── tenants/                 # Per-customer configs + rules (gitignored)
+├── audit/                   # Rule provenance records (gitignored)
+├── src/atrosa/              # Python package (pip install -e .)
+└── node/                    # Node.js/TypeScript CLI
 ```
 
 ## Example: Graduated Rule
@@ -463,19 +460,86 @@ Replace `mock_telemetry.py` with connectors to your actual log sources. The only
 - **Mobile**: Firebase Crashlytics, Sentry
 - **Webhooks**: Stripe/Paystack/Flutterwave event logs
 
-### Adjusting the scoring
+### Production mode (no ground truth)
 
-Modify `ingest.py:score_detections()` to match your environment. The current scorer checks against a ground truth file — in production, you'd use labeled incident data or anomaly review queues.
+```bash
+atrosa hunt --production --tenant acme --hunt-id webhook_desync
+```
 
-## Threat Classes (Roadmap)
+In production mode, ATROSA uses multi-strategy scoring (statistical anomaly, proxy signals, retroactive labels, peer consistency) instead of requiring labeled fraud data. Rules graduate at score >= 70 instead of requiring a perfect 100.
 
-| Class | Description | Status |
-|-------|-------------|--------|
-| `FIN-RACE-*` | Async race conditions / double-spend via webhook desync | Proven |
-| `FIN-TOCTOU-*` | Time-of-check/time-of-use in balance verification | Planned |
-| `FIN-KYC-*` | KYC state machine bypasses (skipping verification steps) | Planned |
-| `FIN-REPLAY-*` | Idempotency key replay / transaction duplication | Planned |
-| `FIN-PRIV-*` | Privilege escalation via role/permission desync | Planned |
+### Multi-tenant deployment
+
+```python
+from tenant import Tenant
+
+# Create a tenant with their connected data sources
+tenant = Tenant.create("acme_bank", data_sources=[
+    "api", "db", "mobile", "webhooks",  # Tier 0: universal
+    "ip_risk", "device_intel",            # Tier 1: enrichment
+    "credit_bureau", "behavioral_biometrics",  # Tier 2: identity
+])
+
+print(tenant.get_active_hunts())  # 17 categories auto-resolved
+print(tenant.get_active_tiers())  # ['tier_0', 'tier_1', 'tier_2']
+```
+
+### Schema normalization
+
+ATROSA auto-maps customer column names to its canonical schema:
+
+```python
+from schema_normalizer import SchemaNormalizer
+
+# Auto-discover: customer_ref → user_id, http_status → status_code
+normalizer = SchemaNormalizer.auto_discover({"api": customer_df})
+normalized = normalizer.normalize(customer_df, "api")
+```
+
+50+ column aliases supported. Value normalization too: `"deposit"` → `"CREDIT"`, `"completed"` → `"success"`.
+
+## Data Source Tiers
+
+ATROSA connects to the customer's existing infrastructure via OAuth — it reads pre-enriched data, never calls external APIs directly.
+
+| Tier | Sources | Rule Categories | Example Providers (Customer's) |
+|------|---------|----------------|-------------------------------|
+| **Tier 0** | API gateway, ledger, mobile, webhooks | 5 (webhook desync, TOCTOU, business logic, reversal abuse, velocity) | Every fintech has these |
+| **Tier 1** | + IP risk, device intel, email risk, SIM intel | +6 (SIM swap ATO, device farms, impossible travel, synthetic ID, credential stuffing, promo abuse) | MaxMind, Fingerprint, Emailage, Telesign |
+| **Tier 2** | + KYC/IDV, credit bureau, sanctions, behavioral biometrics | +6 (KYC cashout, loan stacking, bust-out, push payment scams, sanctions evasion, deepfake) | Jumio, Equifax, World-Check, BioCatch |
+| **Tier 3** | + blockchain, insurance, card networks, ACH, consortium, shipping, open banking | +8 (crypto laundering, ghost broking, claims farming, BIN enumeration, ACH kiting, cross-FI fraud, chargeback abuse, income fabrication) | Chainalysis, Verisk, Visa, CIFAS, Plaid |
+
+**5 rules at Tier 0 → 11 at Tier 1 → 17 at Tier 2 → 25 at Tier 3**
+
+## Threat Classes
+
+| Tier | Category | Severity | Status |
+|------|----------|----------|--------|
+| 0 | Webhook desync / double-spend | Critical | Proven |
+| 0 | TOCTOU / race conditions | Critical | Hunt ready |
+| 0 | Business logic flaws | High | Hunt ready |
+| 0 | Reversal abuse | High | Hunt ready |
+| 0 | Velocity anomaly (brute-force, enumeration) | High | Hunt ready |
+| 1 | SIM swap account takeover | Critical | Hunt ready |
+| 1 | Device farm / multi-accounting | High | Hunt ready |
+| 1 | Impossible travel + cashout | Critical | Hunt ready |
+| 1 | Synthetic identity onboarding | High | Hunt ready |
+| 1 | Proxy-masked credential stuffing | Critical | Hunt ready |
+| 1 | Emulator-driven promo abuse | Medium | Hunt ready |
+| 2 | KYC-gated cashout pipeline | Critical | Hunt ready |
+| 2 | Loan stacking | High | Hunt ready |
+| 2 | Bust-out acceleration | High | Hunt ready |
+| 2 | Authorized push payment scams | Critical | Hunt ready |
+| 2 | Sanctions evasion via layering | Critical | Hunt ready |
+| 2 | Deepfake + fast cashout | Critical | Hunt ready |
+| 3 | Crypto mixer layering | Critical | Hunt ready |
+| 3 | Ghost broking (insurance) | High | Hunt ready |
+| 3 | Claims farming (insurance) | High | Hunt ready |
+| 3 | BIN enumeration escalation | Critical | Hunt ready |
+| 3 | ACH kiting | High | Hunt ready |
+| 3 | Cross-institution fraud | High | Hunt ready |
+| 3 | INR chargeback abuse | Medium | Hunt ready |
+| 3 | Income fabrication (lending) | High | Hunt ready |
 
 ## Design Principles
 
@@ -484,6 +548,8 @@ Modify `ingest.py:score_detections()` to match your environment. The current sco
 - **Iterative proof**: Rules aren't deployed on vibes. They must achieve a perfect SNR score against historical data before graduation.
 - **Separation of concerns**: Heavy LLM compute (Hunter) is decoupled from sub-second production execution (Sentinel).
 - **Closed feedback loop**: The Telemetry Engineer ensures hunts are never permanently blocked by missing data — it identifies gaps, requests fixes, and tracks resolution.
+- **Read-only tap**: ATROSA never calls external APIs. It connects to the customer's existing stack via OAuth and reads pre-enriched data.
+- **Regulatory audit trail**: Full provenance for every rule — which LLM, which prompt, which data version, every iteration. SAR-ready explanations.
 
 ## Supported Providers
 
@@ -533,7 +599,8 @@ MIT
 ## Contributing
 
 Open an issue or PR. Particularly interested in:
-- New hunt prompts for different financial exploit classes
+- New hunt prompts for additional financial exploit classes
 - Real-world telemetry connectors (Kafka, Kinesis, CloudTrail)
 - Sentinel integrations (Kafka consumer, Kinesis, PagerDuty, OpsGenie)
-- Scoring improvements for production environments without ground truth
+- Schema normalizer aliases for region-specific fintech platforms
+- Regulatory templates for specific jurisdictions (FATF, CBN, PCI-DSS, PSD2)
