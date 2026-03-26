@@ -15,3 +15,6 @@ tenants/
 audit/
 active_rules.json
 rules/
+testrun/datasets/
+testrun/transformed/
+testrun/results/
