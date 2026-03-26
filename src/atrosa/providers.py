@@ -62,7 +62,8 @@ class RateLimitError(Exception):
 # ===========================
 class AnthropicProvider(LLMProvider):
 
-    def __init__(self, model: str, system_prompt: str):
+    def __init__(self, model: str, system_prompt: str,
+                 temperature: float = 0.7):
         super().__init__(model, system_prompt)
         import anthropic
         self._anthropic = anthropic
@@ -70,6 +71,7 @@ class AnthropicProvider(LLMProvider):
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY environment variable is required")
         self.client = anthropic.Anthropic(api_key=api_key)
+        self.temperature = temperature
 
     def _call_api(self) -> str:
         try:
@@ -78,6 +80,7 @@ class AnthropicProvider(LLMProvider):
                 max_tokens=4096,
                 system=self.system_prompt,
                 messages=self.messages,
+                temperature=self.temperature,
             )
             return response.content[0].text
         except self._anthropic.RateLimitError:
@@ -97,21 +100,27 @@ class OpenAICompatibleProvider(LLMProvider):
     - vLLM: http://localhost:8000/v1
     """
 
-    def __init__(self, model: str, system_prompt: str, base_url: str, api_key: str):
+    def __init__(self, model: str, system_prompt: str, base_url: str, api_key: str,
+                 temperature: float = 0.7, seed: Optional[int] = None):
         super().__init__(model, system_prompt)
         from openai import OpenAI
         self._openai_module = __import__("openai")
         self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.temperature = temperature
+        self.seed = seed
 
     def _call_api(self) -> str:
         messages = [{"role": "system", "content": self.system_prompt}] + self.messages
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": 4096,
+            "temperature": self.temperature,
+        }
+        if self.seed is not None:
+            kwargs["seed"] = self.seed
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=4096,
-                temperature=0.7,
-            )
+            response = self.client.chat.completions.create(**kwargs)
             return response.choices[0].message.content
         except self._openai_module.RateLimitError:
             raise RateLimitError()
@@ -225,13 +234,24 @@ def create_provider(
     system_prompt: str,
     model: Optional[str] = None,
     base_url: Optional[str] = None,
+    temperature: Optional[float] = None,
+    seed: Optional[int] = None,
+    production: bool = False,
 ) -> LLMProvider:
-    """Factory function to create the right provider."""
+    """
+    Factory function to create the right provider.
 
+    In production mode (production=True), temperature defaults to 0.0
+    for deterministic outputs. In dev mode, defaults to 0.7.
+    """
     model = model or DEFAULT_MODELS.get(provider_name)
 
+    if temperature is None:
+        temperature = 0.0 if production else 0.7
+
     if provider_name == "anthropic":
-        return AnthropicProvider(model=model, system_prompt=system_prompt)
+        return AnthropicProvider(model=model, system_prompt=system_prompt,
+                                  temperature=temperature)
 
     elif provider_name == "openai":
         return OpenAIProvider(model=model, system_prompt=system_prompt)

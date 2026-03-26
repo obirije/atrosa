@@ -338,6 +338,45 @@ if __name__ == "__main__":
   return false;
 }
 
+/**
+ * In production mode, delegate to the Python orchestrator which has
+ * full support for production scoring, audit trail, tenant config,
+ * and the 25-category hunt catalog. The Node.js hunt loop is used
+ * for development/testing only.
+ */
+function runProductionHunt(opts: {
+  provider: string;
+  model?: string;
+  baseUrl?: string;
+  maxIterations: string;
+  huntPrompt: string;
+  tenant: string;
+  huntId?: string;
+}): boolean {
+  const args = [
+    "orchestrator.py",
+    "--production",
+    "--provider", opts.provider,
+    "--tenant", opts.tenant,
+  ];
+  if (opts.model) args.push("--model", opts.model);
+  if (opts.baseUrl) args.push("--base-url", opts.baseUrl);
+  if (opts.huntId) args.push("--hunt-id", opts.huntId);
+  args.push("--max-iterations", opts.maxIterations);
+  args.push("--hunt-prompt", opts.huntPrompt);
+
+  try {
+    execFileSync("python3", args, {
+      cwd: process.cwd(),
+      stdio: "inherit",
+      timeout: 600_000, // 10 minutes
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function registerHuntCommand(program: Command): void {
   program
     .command("hunt")
@@ -359,7 +398,29 @@ export function registerHuntCommand(program: Command): void {
       "Path to hunt prompt file",
       HUNT_PROMPT_PATH,
     )
+    .option(
+      "-t, --tenant <id>",
+      "Tenant ID for multi-customer deployment",
+      "default",
+    )
+    .option(
+      "--production",
+      "Production mode (ground-truth-free scoring, audit trail, temperature=0)",
+    )
+    .option(
+      "--hunt-id <id>",
+      "Hunt category ID from catalog (e.g. webhook_desync, sim_swap_ato)",
+    )
     .action(async (opts) => {
+      if (opts.production) {
+        // Production mode: delegate to Python orchestrator for full
+        // scoring, audit trail, tenant config, and hunt catalog support
+        console.log("[*] Production mode — delegating to Python orchestrator");
+        const success = runProductionHunt(opts);
+        process.exit(success ? 0 : 1);
+      }
+
+      // Development mode: use the Node.js hunt loop
       const success = await runHunt(
         opts.provider,
         opts.model,

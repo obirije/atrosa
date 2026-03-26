@@ -77,6 +77,21 @@ Providers & default models:
         default="hunt.md",
         help="Path to hunt prompt file (default: hunt.md)",
     )
+    hunt_parser.add_argument(
+        "--tenant", "-t",
+        default="default",
+        help="Tenant ID for multi-customer deployment (default: default)",
+    )
+    hunt_parser.add_argument(
+        "--production",
+        action="store_true",
+        help="Enable production mode (ground-truth-free scoring, temperature=0, audit trail)",
+    )
+    hunt_parser.add_argument(
+        "--hunt-id",
+        default=None,
+        help="Hunt category ID from hunt_catalog (e.g. webhook_desync, sim_swap_ato)",
+    )
 
     # --- sentinel ---
     sentinel_parser = subparsers.add_parser(
@@ -185,6 +200,9 @@ Subcommands:
             provider_name=args.provider,
             model=args.model,
             base_url=args.base_url,
+            tenant_id=getattr(args, "tenant", "default"),
+            production=getattr(args, "production", False),
+            hunt_id=getattr(args, "hunt_id", None),
         )
         sys.exit(0 if success else 1)
 
