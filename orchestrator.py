@@ -531,12 +531,24 @@ Examples:
         default=None,
         help="Hunt category ID from hunt_catalog (e.g. webhook_desync, sim_swap_ato)",
     )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Path to data directory (overrides default data/ for test runs)",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     HUNT_PROMPT_PATH = Path(args.hunt_prompt)
+
+    # Override data directory if specified (for testrun pipeline)
+    if args.data_dir:
+        import ingest
+        ingest.DATA_DIR = Path(args.data_dir)
+        ingest.GROUND_TRUTH_PATH = Path(args.data_dir) / ".ground_truth.json"
+
     success = run_hunt(
         provider_name=args.provider,
         model=args.model,
