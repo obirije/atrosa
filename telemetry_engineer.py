@@ -333,6 +333,16 @@ class DeliveryChannel:
     """Delivers observability requests to external systems."""
 
     @staticmethod
+    def _validate_url(url: str, name: str) -> bool:
+        """Validate that a URL uses HTTPS (or localhost for dev)."""
+        if url.startswith("https://"):
+            return True
+        if url.startswith("http://localhost") or url.startswith("http://127.0.0.1"):
+            return True
+        print(f"  [{name}] BLOCKED — URL must use HTTPS (got: {url[:50]}...)")
+        return False
+
+    @staticmethod
     def deliver(request: dict, channels: list[str]):
         for channel in channels:
             if channel == "console":
@@ -361,6 +371,8 @@ class DeliveryChannel:
         url = os.environ.get("TELEMETRY_SLACK_WEBHOOK")
         if not url:
             print(f"  [SLACK] TELEMETRY_SLACK_WEBHOOK not set — skipping Slack delivery")
+            return
+        if not DeliveryChannel._validate_url(url, "SLACK"):
             return
 
         severity_emoji = {
@@ -437,6 +449,8 @@ class DeliveryChannel:
 
         if not all([jira_url, jira_token, jira_project]):
             print(f"  [JIRA] TELEMETRY_JIRA_URL/TOKEN/PROJECT not set — skipping")
+            return
+        if not DeliveryChannel._validate_url(jira_url, "JIRA"):
             return
 
         priority_map = {"critical": "Highest", "high": "High", "medium": "Medium", "low": "Low"}

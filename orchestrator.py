@@ -76,16 +76,19 @@ class HunterLLM:
 
 
 def extract_code_block(text: str) -> Optional[str]:
-    """Extract the first Python code block from LLM output."""
+    """Extract the first Python code block from LLM output.
+
+    Security: Only accepts code within proper ``` fences.
+    The previous fallback that accepted any text containing 'import' and
+    'def detect' was removed — it allowed arbitrary text to be treated as
+    executable Python, which is an injection vector.
+    """
     import re
     # Match ```python ... ``` or ``` ... ```
     pattern = r"```(?:python)?\s*\n(.*?)```"
     match = re.search(pattern, text, re.DOTALL)
     if match:
         return match.group(1).strip()
-    # If no code block, check if the entire response looks like Python
-    if "import " in text and "def detect" in text:
-        return text.strip()
     return None
 
 
@@ -158,6 +161,9 @@ def graduate_rule(detect_code: str, score_result: dict, iteration: int):
     else:
         rules_data = {"rules": []}
 
+    # Compute code hash for integrity verification at load time
+    code_hash = hashlib.sha256(detect_code.encode()).hexdigest()[:12]
+
     rule_entry = {
         "rule_id": rule_id,
         "threat_hypothesis": "Double-spend via webhook desync: CREDIT without matching DEBIT after forced network disconnect",
@@ -167,6 +173,7 @@ def graduate_rule(detect_code: str, score_result: dict, iteration: int):
         "confidence_score": score_result.get("tx_precision", 0.99),
         "graduated_at": datetime.now().isoformat(),
         "iterations_to_prove": iteration,
+        "code_hash": code_hash,
     }
 
     rules_data["rules"].append(rule_entry)
@@ -313,7 +320,23 @@ if __name__ == "__main__":
             print(f"[!] LLM error: {e}")
             continue
 
-        # Step 2: Write the new detect.py
+        # Step 2: Validate code safety before writing
+        try:
+            from code_validator import validate_and_report
+            if not validate_and_report(new_code):
+                feedback_context = (
+                    f"ITERATION {iteration} RESULT:\n"
+                    f"Your detect.py was REJECTED by the security validator. "
+                    f"Detection scripts may only use: pandas, json, re, datetime, collections, math, sys. "
+                    f"You MUST NOT use: os, subprocess, socket, urllib, eval, exec, open() for writing, "
+                    f"or any network/file-system operations. "
+                    f"Return the COMPLETE corrected detect.py in a Python code block."
+                )
+                continue
+        except ImportError:
+            pass  # Validator not available — proceed without validation
+
+        # Step 3: Write the new detect.py
         DETECT_PATH.write_text(new_code)
         print(f"[*] detect.py updated ({len(new_code)} chars)")
 
@@ -321,14 +344,14 @@ if __name__ == "__main__":
         log_path = LOG_DIR / f"iteration_{iteration:02d}.py"
         log_path.write_text(new_code)
 
-        # Step 3: Execute detect.py
+        # Step 4: Execute detect.py
         print("[*] Executing detect.py...")
         t0 = time.time()
         detection_output = run_detect()
         elapsed = time.time() - t0
         print(f"[*] Execution completed in {elapsed:.2f}s")
 
-        # Step 4: Check for errors
+        # Step 5: Check for errors
         if "error" in detection_output and detection_output["error"]:
             print(f"[!] Error: {detection_output['error']}")
 

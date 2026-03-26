@@ -2,9 +2,14 @@
  * ATROSA Rule Engine — Load + execute graduated detection rules
  *
  * Rules are Python detect.py scripts. We shell out to Python to run them.
+ *
+ * Security:
+ *  - Path validation: rule scripts must be within allowed directories
+ *  - Hash integrity: file hash verified against graduation record
  */
 
 import fs from "node:fs";
+import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { RULES_PATH } from "../utils/paths.js";
@@ -18,6 +23,7 @@ export interface Rule {
   confidence_score: number;
   graduated_at: string;
   iterations_to_prove: number;
+  code_hash?: string;
 }
 
 export interface RulesData {
@@ -28,6 +34,47 @@ export interface RuleExecResult {
   flagged_tx_ids: string[];
   flagged_user_ids: string[];
   error?: string;
+}
+
+// Allowed directories for rule scripts (prevent path traversal)
+const ALLOWED_RULE_DIRS = new Set(["rules", "tenants"]);
+
+function validateRulePath(scriptPath: string): boolean {
+  const resolved = path.resolve(scriptPath);
+  const cwd = process.cwd();
+
+  // Must be under the current working directory
+  if (!resolved.startsWith(cwd + path.sep)) {
+    return false;
+  }
+
+  // Get relative path and check first directory
+  const relative = path.relative(cwd, resolved);
+  const parts = relative.split(path.sep);
+
+  if (parts.length === 0 || !ALLOWED_RULE_DIRS.has(parts[0])) {
+    return false;
+  }
+
+  // Must not contain path traversal
+  if (parts.includes("..")) {
+    return false;
+  }
+
+  // Must be a .py file
+  if (!resolved.endsWith(".py")) {
+    return false;
+  }
+
+  return true;
+}
+
+function verifyRuleHash(scriptPath: string, expectedHash?: string): boolean {
+  if (!expectedHash) return true; // No hash recorded — legacy rule
+
+  const content = fs.readFileSync(scriptPath);
+  const actualHash = crypto.createHash("sha256").update(content).digest("hex").slice(0, 12);
+  return actualHash === expectedHash;
 }
 
 export class RuleEngine {
@@ -46,11 +93,31 @@ export class RuleEngine {
     this.rules = data.rules || [];
 
     for (const rule of this.rules) {
+      // Security: validate path is within allowed directories
+      if (!validateRulePath(rule.detection_logic_file)) {
+        console.log(
+          `[!] Rule ${rule.rule_id}: BLOCKED — path '${rule.detection_logic_file}' is outside allowed directories`,
+        );
+        continue;
+      }
+
       const scriptPath = path.resolve(rule.detection_logic_file);
       if (!fs.existsSync(scriptPath)) {
         console.log(`[!] Rule ${rule.rule_id}: missing script ${scriptPath}`);
         continue;
       }
+
+      // Security: verify file hash matches graduation record
+      if (rule.code_hash && !verifyRuleHash(scriptPath, rule.code_hash)) {
+        console.log(
+          `[!] Rule ${rule.rule_id}: BLOCKED — file hash does not match graduation record`,
+        );
+        console.log(
+          `    The rule file may have been modified after graduation.`,
+        );
+        continue;
+      }
+
       this.loadedRuleIds.add(rule.rule_id);
       console.log(`    Loaded rule: ${rule.rule_id} (${scriptPath})`);
     }

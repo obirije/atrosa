@@ -13,3 +13,5 @@ node/dist/
 paper_fraud_landscape.md
 tenants/
 audit/
+active_rules.json
+rules/

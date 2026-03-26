@@ -55,6 +55,16 @@ class MitigationRegistry:
         self.register("webhook", self._action_webhook)
         self.register("slack", self._action_slack)
 
+    @staticmethod
+    def _validate_url(url: str, name: str) -> bool:
+        """Validate that a webhook URL uses HTTPS (or localhost for dev)."""
+        if url.startswith("https://"):
+            return True
+        if url.startswith("http://localhost") or url.startswith("http://127.0.0.1"):
+            return True
+        print(f"  [{name}] BLOCKED — URL must use HTTPS (got: {url[:50]}...)")
+        return False
+
     def register(self, name: str, fn: Callable):
         self._actions[name] = fn
 
@@ -87,6 +97,9 @@ class MitigationRegistry:
             print("  [WEBHOOK] SENTINEL_WEBHOOK_URL not set, falling back to log")
             self._action_log_alert(alert)
             return
+        if not self._validate_url(url, "WEBHOOK"):
+            self._action_log_alert(alert)
+            return
         try:
             import urllib.request
             req = urllib.request.Request(
@@ -106,6 +119,9 @@ class MitigationRegistry:
         url = os.environ.get("SENTINEL_SLACK_WEBHOOK")
         if not url:
             print("  [SLACK] SENTINEL_SLACK_WEBHOOK not set, falling back to log")
+            self._action_log_alert(alert)
+            return
+        if not self._validate_url(url, "SLACK"):
             self._action_log_alert(alert)
             return
         rule_id = alert.get("rule_id", "UNKNOWN")
@@ -141,9 +157,49 @@ class MitigationRegistry:
 class RuleEngine:
     """Loads and executes graduated detection rules."""
 
+    # Allowed directories for rule scripts (prevent path traversal)
+    ALLOWED_RULE_DIRS = {"rules", "tenants"}
+
     def __init__(self):
         self.rules: list[dict] = []
         self.rule_modules: dict[str, object] = {}
+
+    @staticmethod
+    def _validate_rule_path(script_path: Path) -> bool:
+        """Validate that the rule script path is within allowed directories."""
+        resolved = script_path.resolve()
+        cwd = Path.cwd().resolve()
+
+        # Must be relative to cwd and within allowed directories
+        try:
+            relative = resolved.relative_to(cwd)
+        except ValueError:
+            return False  # Path is outside the project directory
+
+        # First component must be an allowed directory
+        parts = relative.parts
+        if not parts or parts[0] not in RuleEngine.ALLOWED_RULE_DIRS:
+            return False
+
+        # Must not contain path traversal
+        if ".." in parts:
+            return False
+
+        # Must be a .py file
+        if not str(resolved).endswith(".py"):
+            return False
+
+        return True
+
+    @staticmethod
+    def _verify_rule_hash(script_path: Path, expected_hash: str) -> bool:
+        """Verify the rule file's SHA-256 matches the expected hash from graduation."""
+        if not expected_hash:
+            return True  # No hash recorded — skip verification (legacy rules)
+
+        import hashlib
+        actual_hash = hashlib.sha256(script_path.read_bytes()).hexdigest()[:12]
+        return actual_hash == expected_hash
 
     def load_rules(self):
         """Load rules from active_rules.json and import their detection scripts."""
@@ -160,8 +216,21 @@ class RuleEngine:
             rule_id = rule["rule_id"]
             script_path = Path(rule["detection_logic_file"])
 
+            # Security: validate path is within allowed directories
+            if not self._validate_rule_path(script_path):
+                print(f"[!] Rule {rule_id}: BLOCKED — path '{script_path}' is outside allowed directories")
+                continue
+
             if not script_path.exists():
                 print(f"[!] Rule {rule_id}: missing script {script_path}")
+                continue
+
+            # Security: verify file hash matches graduation record
+            expected_hash = rule.get("code_hash", "")
+            if expected_hash and not self._verify_rule_hash(script_path, expected_hash):
+                print(f"[!] Rule {rule_id}: BLOCKED — file hash does not match graduation record")
+                print(f"    The rule file may have been modified after graduation.")
+                print(f"    Re-run the Hunter to regenerate this rule.")
                 continue
 
             try:
@@ -259,7 +328,7 @@ class SimulatedStream:
         self._offset = 0
 
     def _load_data(self):
-        from .ingest import load_jsonl
+        from ingest import load_jsonl
         data_dir = Path("data")
         self.all_events = pd.concat([
             load_jsonl(data_dir / "api_gateway.jsonl"),
@@ -302,7 +371,7 @@ class WatchStream:
             if fpath not in self._seen_files:
                 self._seen_files.add(fpath)
                 try:
-                    from .ingest import load_jsonl
+                    from ingest import load_jsonl
                     df = load_jsonl(f)
                     new_events.append(df)
                     print(f"  [WATCH] New file: {f.name} ({len(df)} events)")
