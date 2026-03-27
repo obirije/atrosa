@@ -77,7 +77,7 @@ BLOCKED_NAMES = frozenset({
     "send", "sendall", "sendto", "recv", "recvfrom",
     # File system (writes)
     "remove", "unlink", "rmdir", "rmtree",
-    "rename", "replace", "makedirs", "mkdir",
+    "makedirs", "mkdir",
     "chmod", "chown", "chroot",
     # Dangerous modules accessed as attributes
     "subprocess", "socket", "http", "urllib",

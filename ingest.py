@@ -9,13 +9,14 @@ This file is NOT modified by the Hunter agent during iteration.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 
-DATA_DIR = Path("data")
+DATA_DIR = Path(os.environ.get("ATROSA_DATA_DIR", "data"))
 GROUND_TRUTH_PATH = DATA_DIR / ".ground_truth.json"
 
 
@@ -155,13 +156,14 @@ def score_detections(
     if score < 100:
         if tx_recall < 1.0:
             feedback_parts.append(
-                "Hint: Look for transaction IDs that have a webhook CREDIT but no corresponding DEBIT. "
-                "Correlate across ledger_db_commits and payment_webhooks."
+                "Hint: You are missing anomalous transactions. "
+                "Try different cross-correlation strategies across the available data sources. "
+                "Look for statistical outliers in amounts, balances, timing, or error patterns."
             )
         if len(false_pos_tx) > 0:
             feedback_parts.append(
-                "Hint: Reduce false positives by requiring MULTIPLE correlated signals — "
-                "e.g., network_error on mobile + late webhook + missing debit."
+                "Hint: Reduce false positives by requiring MULTIPLE correlated signals "
+                "from different data sources for the same transaction or user."
             )
 
     if score == 100:

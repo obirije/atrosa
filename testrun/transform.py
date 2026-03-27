@@ -88,8 +88,8 @@ DATASET_CONFIGS = {
         "balance_after_column": None,
     },
     "sparkov": {
-        "description": "Sparkov credit card — card fraud, BIN enumeration patterns",
-        "file_glob": "*.csv",
+        "description": "Sparkov credit card — card fraud, BIN enumeration patterns, geo anomalies",
+        "file_glob": "fraud*.csv",
         "fraud_column": "is_fraud",
         "fraud_values": [1, "1", True],
         "user_id_column": "cc_num",
@@ -99,10 +99,40 @@ DATASET_CONFIGS = {
         "timestamp_mode": "datetime",
         "amount_column": "amt",
         "type_column": "category",
-        "type_to_endpoint": {},
+        "type_to_endpoint": {
+            "grocery_pos": "/api/v2/payment/grocery",
+            "gas_transport": "/api/v2/payment/gas",
+            "home": "/api/v2/payment/home",
+            "shopping_pos": "/api/v2/payment/shopping",
+            "kids_pets": "/api/v2/payment/kids",
+            "personal_care": "/api/v2/payment/personal",
+            "health_fitness": "/api/v2/payment/health",
+            "food_dining": "/api/v2/payment/dining",
+            "misc_net": "/api/v2/payment/misc_online",
+            "misc_pos": "/api/v2/payment/misc_pos",
+            "shopping_net": "/api/v2/payment/shopping_online",
+            "entertainment": "/api/v2/payment/entertainment",
+            "travel": "/api/v2/payment/travel",
+        },
         "type_to_operation": {},
         "balance_before_column": None,
         "balance_after_column": None,
+        # Extra raw columns to pass through to specific DataFrames
+        "extra_api_columns": {
+            "ip_address": "lat,long",       # Customer lat/long as geo proxy
+        },
+        "extra_db_columns": {
+            "provider": "merchant",          # Merchant name as provider
+        },
+        "extra_mobile_columns": {
+            "device_os": "gender",           # Demographics as device context
+            "screen": "category",            # Merchant category as screen/context
+            "ip_address": "city,state",      # Customer location
+        },
+        "extra_webhook_columns": {
+            "provider": "merchant",          # Merchant name
+            "ip_address": "merch_lat,merch_long",  # Merchant geo
+        },
     },
     "ccfraud": {
         "description": "ULB credit card fraud — PCA-anonymized benchmark",
@@ -203,13 +233,34 @@ class DatasetTransformer:
         else:
             df["_amount"] = self.rng.uniform(100, 50000, len(df)).round(2)
 
-        # Build 4 DataFrames
+        # Sample at the transaction level BEFORE building DataFrames.
+        # This preserves cross-source correlation: the same transaction_id
+        # appears in all 4 sources. Ground truth only references sampled txns.
+        if self.sample_size and len(df) > self.sample_size:
+            n_fraud = fraud_mask.sum()
+            n_sample = self.sample_size
+
+            # Always include ALL fraud transactions, fill remainder with normal
+            fraud_idx = df.index[fraud_mask]
+            normal_idx = df.index[~fraud_mask]
+            n_normal_needed = max(0, n_sample - len(fraud_idx))
+            if n_normal_needed > 0 and len(normal_idx) > 0:
+                normal_sample = self.rng.choice(normal_idx, min(n_normal_needed, len(normal_idx)), replace=False)
+                keep_idx = np.concatenate([fraud_idx.values, normal_sample])
+            else:
+                keep_idx = fraud_idx.values
+
+            df = df.loc[keep_idx].reset_index(drop=True)
+            fraud_mask = self._resolve_fraud_labels(df)
+            print(f"    Sampled to {len(df):,} rows (all {n_fraud:,} fraud + {len(df) - fraud_mask.sum():,} normal)")
+
+        # Build 4 DataFrames from the SAME rows — cross-source correlation intact
         df_api = self._build_api(df, fraud_mask)
         df_db = self._build_db(df, fraud_mask)
         df_mobile = self._build_mobile(df, fraud_mask)
         df_webhooks = self._build_webhooks(df, fraud_mask)
 
-        # Ground truth
+        # Ground truth reflects only what's in the sample
         fraud_tx_ids = df.loc[fraud_mask, "_txn_id"].tolist()
         fraud_user_ids = df.loc[fraud_mask, "_user_id"].unique().tolist()
 
@@ -243,8 +294,8 @@ class DatasetTransformer:
 
         for key, filename in file_map.items():
             df = result[key]
-            if self.sample_size and len(df) > self.sample_size:
-                df = df.sample(n=self.sample_size, random_state=42)
+            # Sampling already happened in transform() at the transaction level
+            # to preserve cross-source correlation. No re-sampling here.
             path = out_dir / filename
             with open(path, "w") as f:
                 for _, row in df.iterrows():
@@ -324,7 +375,12 @@ class DatasetTransformer:
     # ===========================
     # DATAFRAME BUILDERS
     # ===========================
+    # Principle: only use data that exists in the raw dataset.
+    # Where the dataset doesn't have a column, use a constant — never randomize.
+    # The fraud signal must come from the real data, not from synthetic injection.
+
     def _build_api(self, df: pd.DataFrame, fraud_mask: pd.Series) -> pd.DataFrame:
+        """API gateway log — derived directly from raw transaction data."""
         n = len(df)
         type_col = self.config["type_column"]
         endpoint_map = self.config["type_to_endpoint"]
@@ -334,24 +390,29 @@ class DatasetTransformer:
         else:
             endpoints = pd.Series(["/api/v2/transfer/initiate"] * n)
 
+        # Resolve extra columns from raw data
+        extras = self.config.get("extra_api_columns", {})
+        ip_address = self._resolve_extra(df, extras.get("ip_address"), "0.0.0.0")
+
         return pd.DataFrame({
             "source": "api_gateway",
-            "timestamp": df["_timestamp"].dt.isoformat(),
+            "timestamp": df["_timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S"),
             "request_id": [f"REQ-{i:08x}" for i in range(n)],
             "user_id": df["_user_id"],
             "session_id": [f"SES-{hash(uid) % 10**8:08x}" for uid in df["_user_id"]],
             "method": "POST",
             "endpoint": endpoints,
-            "status_code": np.where(fraud_mask, self.rng.choice([200, 200, 500], n), 200),
-            "response_time_ms": self.rng.integers(15, 800, n),
-            "ip_address": [f"{self.rng.integers(1,224)}.{self.rng.integers(0,256)}.{self.rng.integers(0,256)}.{self.rng.integers(1,255)}" for _ in range(n)],
-            "user_agent": self.rng.choice(["App/2.1 (Android 14)", "App/2.1 (iOS 17)", "Mozilla/5.0"], n),
+            "status_code": 200,
+            "response_time_ms": 100,
+            "ip_address": ip_address,
+            "user_agent": "App/1.0",
             "transaction_id": df["_txn_id"],
             "amount": df["_amount"],
             "currency": "USD",
         })
 
     def _build_db(self, df: pd.DataFrame, fraud_mask: pd.Series) -> pd.DataFrame:
+        """Ledger DB — uses real balance data when available."""
         n = len(df)
         type_col = self.config["type_column"]
         op_map = self.config["type_to_operation"]
@@ -361,21 +422,25 @@ class DatasetTransformer:
         if type_col and type_col in df.columns and op_map:
             operations = df[type_col].map(op_map).fillna("DEBIT")
         else:
-            operations = pd.Series(np.where(fraud_mask, "CREDIT", self.rng.choice(["CREDIT", "DEBIT"], n)))
+            operations = pd.Series(["DEBIT"] * n)
 
         if bal_before_col and bal_before_col in df.columns:
             balance_before = pd.to_numeric(df[bal_before_col], errors="coerce").fillna(0).round(2)
         else:
-            balance_before = self.rng.uniform(1000, 500000, n).round(2)
+            balance_before = pd.Series([0.0] * n)
 
         if bal_after_col and bal_after_col in df.columns:
             balance_after = pd.to_numeric(df[bal_after_col], errors="coerce").fillna(0).round(2)
         else:
-            balance_after = balance_before + np.where(operations == "CREDIT", df["_amount"], -df["_amount"])
+            balance_after = pd.Series([0.0] * n)
+
+        # Resolve extra columns
+        extras = self.config.get("extra_db_columns", {})
+        provider = self._resolve_extra(df, extras.get("provider"), "unknown")
 
         return pd.DataFrame({
             "source": "ledger_db_commits",
-            "timestamp": (df["_timestamp"] + pd.Timedelta(seconds=1)).dt.isoformat(),
+            "timestamp": (df["_timestamp"] + pd.Timedelta(seconds=1)).dt.strftime("%Y-%m-%dT%H:%M:%S"),
             "commit_id": [f"CMT-{i:08x}" for i in range(n)],
             "user_id": df["_user_id"],
             "operation": operations,
@@ -384,72 +449,90 @@ class DatasetTransformer:
             "balance_before": balance_before,
             "balance_after": balance_after,
             "transaction_id": df["_txn_id"],
-            "provider": self.rng.choice(["paystack", "flutterwave", "stripe"], n),
+            "provider": provider,
             "idempotency_key": [f"IDEM-{i:08x}" for i in range(n)],
         })
 
     def _build_mobile(self, df: pd.DataFrame, fraud_mask: pd.Series) -> pd.DataFrame:
-        # Fraud-associated events
-        fraud_idx = df.index[fraud_mask]
-        n_fraud = len(fraud_idx)
+        """Mobile events — one event per transaction. Uses real data where available."""
+        n = len(df)
+        type_col = self.config["type_column"]
 
-        # Normal events (sample proportionally, capped)
-        normal_idx = df.index[~fraud_mask]
-        n_normal = min(len(normal_idx), max(n_fraud * 20, 10000))
-        if n_normal > 0:
-            normal_idx = self.rng.choice(normal_idx, n_normal, replace=False)
+        type_to_event = {
+            "CASH_IN": "deposit_initiated",
+            "CASH_OUT": "withdrawal_initiated",
+            "DEBIT": "debit_initiated",
+            "PAYMENT": "payment_initiated",
+            "TRANSFER": "transfer_initiated",
+        }
 
-        fraud_events = pd.DataFrame({
+        if type_col and type_col in df.columns:
+            event_types = df[type_col].map(type_to_event).fillna("transaction_initiated")
+        else:
+            event_types = pd.Series(["transaction_initiated"] * n)
+
+        # Resolve extra columns from raw data
+        extras = self.config.get("extra_mobile_columns", {})
+        device_os = self._resolve_extra(df, extras.get("device_os"), "unknown")
+        screen = self._resolve_extra(df, extras.get("screen"), "transaction")
+        ip_address = self._resolve_extra(df, extras.get("ip_address"), "0.0.0.0")
+
+        return pd.DataFrame({
             "source": "mobile_client_errors",
-            "timestamp": (df.loc[fraud_idx, "_timestamp"] + pd.Timedelta(seconds=2)).dt.isoformat(),
-            "event_id": [f"EVT-F-{i:08x}" for i in range(n_fraud)],
-            "user_id": df.loc[fraud_idx, "_user_id"].values,
-            "session_id": [f"SES-{hash(u) % 10**8:08x}" for u in df.loc[fraud_idx, "_user_id"]],
-            "event_type": "network_error",
-            "device_os": self.rng.choice(["Android 14", "Android 13"], n_fraud),
-            "app_version": "2.1.0",
-            "network_type": self.rng.choice(["4G", "3G"], n_fraud),
-            "error_code": "E_NETWORK_LOST",
-            "screen": "transfer",
-            "ip_address": [f"{self.rng.integers(1,224)}.{self.rng.integers(0,256)}.{self.rng.integers(0,256)}.{self.rng.integers(1,255)}" for _ in range(n_fraud)],
-        }) if n_fraud > 0 else pd.DataFrame()
-
-        normal_events = pd.DataFrame({
-            "source": "mobile_client_errors",
-            "timestamp": df.loc[normal_idx, "_timestamp"].dt.isoformat(),
-            "event_id": [f"EVT-N-{i:08x}" for i in range(n_normal)],
-            "user_id": df.loc[normal_idx, "_user_id"].values,
-            "session_id": [f"SES-{hash(u) % 10**8:08x}" for u in df.loc[normal_idx, "_user_id"]],
-            "event_type": self.rng.choice(["app_open", "screen_view", "transfer_initiated", "biometric_auth"], n_normal),
-            "device_os": self.rng.choice(["Android 14", "iOS 17.4", "Android 13"], n_normal),
-            "app_version": "2.1.0",
-            "network_type": self.rng.choice(["4G", "WiFi", "3G"], n_normal),
-            "error_code": np.where(self.rng.random(n_normal) > 0.9, "E_TIMEOUT", None),
-            "screen": self.rng.choice(["home", "transfer", "history", "settings"], n_normal),
-            "ip_address": [f"{self.rng.integers(1,224)}.{self.rng.integers(0,256)}.{self.rng.integers(0,256)}.{self.rng.integers(1,255)}" for _ in range(n_normal)],
-        }) if n_normal > 0 else pd.DataFrame()
-
-        return pd.concat([fraud_events, normal_events], ignore_index=True)
+            "timestamp": df["_timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "event_id": [f"EVT-{i:08x}" for i in range(n)],
+            "user_id": df["_user_id"],
+            "session_id": [f"SES-{hash(uid) % 10**8:08x}" for uid in df["_user_id"]],
+            "event_type": event_types,
+            "device_os": device_os,
+            "app_version": "1.0.0",
+            "network_type": "unknown",
+            "error_code": None,
+            "screen": screen,
+            "ip_address": ip_address,
+        })
 
     def _build_webhooks(self, df: pd.DataFrame, fraud_mask: pd.Series) -> pd.DataFrame:
+        """Webhook events — one per transaction. Uses real data where available."""
         n = len(df)
+
+        # Resolve extra columns from raw data
+        extras = self.config.get("extra_webhook_columns", {})
+        provider = self._resolve_extra(df, extras.get("provider"), "unknown")
+        ip_address = self._resolve_extra(df, extras.get("ip_address"), "0.0.0.0")
+
         return pd.DataFrame({
             "source": "payment_webhooks",
-            "timestamp": (df["_timestamp"] + pd.Timedelta(seconds=int(self.rng.integers(5, 60)))).dt.isoformat(),
+            "timestamp": (df["_timestamp"] + pd.Timedelta(seconds=5)).dt.strftime("%Y-%m-%dT%H:%M:%S"),
             "webhook_id": [f"WH-{i:08x}" for i in range(n)],
-            "provider": self.rng.choice(["paystack", "flutterwave", "stripe"], n),
-            "event_type": np.where(fraud_mask, "payment.completed",
-                                   self.rng.choice(["payment.completed", "payment.completed", "payment.failed"], n)),
+            "provider": provider,
+            "event_type": "payment.completed",
             "transaction_id": df["_txn_id"],
             "user_id": df["_user_id"],
             "amount": df["_amount"],
             "currency": "USD",
-            "status": np.where(fraud_mask, "success",
-                              self.rng.choice(["success", "success", "success", "failed"], n)),
-            "delivery_attempt": np.where(fraud_mask, self.rng.integers(2, 5, n), 1),
-            "latency_ms": np.where(fraud_mask, self.rng.integers(60000, 300000, n),
-                                   self.rng.integers(50, 5000, n)),
+            "status": "success",
+            "delivery_attempt": 1,
+            "latency_ms": 100,
         })
+
+    def _resolve_extra(self, df: pd.DataFrame, spec: str, default: str) -> pd.Series:
+        """Resolve an extra column spec. Spec can be a single column name
+        or 'col1,col2' to concatenate multiple columns."""
+        if not spec:
+            return pd.Series([default] * len(df), index=df.index)
+
+        cols = [c.strip() for c in spec.split(",")]
+        available = [c for c in cols if c in df.columns]
+
+        if not available:
+            return pd.Series([default] * len(df), index=df.index)
+
+        if len(available) == 1:
+            return df[available[0]].astype(str).fillna(default)
+
+        # Concatenate multiple columns
+        return df[available].astype(str).apply(lambda row: ",".join(row), axis=1)
 
 
 # ===========================

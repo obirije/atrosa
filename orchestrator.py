@@ -543,11 +543,10 @@ if __name__ == "__main__":
     args = parse_args()
     HUNT_PROMPT_PATH = Path(args.hunt_prompt)
 
-    # Override data directory if specified (for testrun pipeline)
+    # Override data directory if specified (for testrun pipeline).
+    # Set as env var so detect.py subprocess inherits it via ingest.DATA_DIR.
     if args.data_dir:
-        import ingest
-        ingest.DATA_DIR = Path(args.data_dir)
-        ingest.GROUND_TRUTH_PATH = Path(args.data_dir) / ".ground_truth.json"
+        os.environ["ATROSA_DATA_DIR"] = str(Path(args.data_dir).resolve())
 
     success = run_hunt(
         provider_name=args.provider,
