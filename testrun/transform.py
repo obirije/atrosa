@@ -168,6 +168,50 @@ DATASET_CONFIGS = {
         "balance_before_column": None,
         "balance_after_column": None,
     },
+    "ieee_cis": {
+        "description": "IEEE-CIS e-commerce fraud — card fraud, device fingerprint, identity features",
+        "file_glob": "train_transaction.csv",
+        "identity_file": "train_identity.csv",  # Joined on TransactionID
+        "fraud_column": "isFraud",
+        "fraud_values": [1, "1"],
+        "user_id_column": "card1",
+        "user_id_prefix": "USR-IEEE-",
+        "user_id_strip": "",
+        "timestamp_column": "TransactionDT",
+        "timestamp_mode": "seconds_offset",
+        "amount_column": "TransactionAmt",
+        "type_column": "ProductCD",
+        "type_to_endpoint": {
+            "W": "/api/v2/payment/web",
+            "H": "/api/v2/payment/hosted",
+            "C": "/api/v2/payment/card",
+            "S": "/api/v2/payment/subscription",
+            "R": "/api/v2/payment/recurring",
+        },
+        "type_to_operation": {},
+        "balance_before_column": None,
+        "balance_after_column": None,
+        # Real multi-source data from the dataset
+        "extra_api_columns": {
+            "ip_address": "addr1,addr2",        # Address codes as location proxy
+        },
+        "extra_db_columns": {
+            "provider": "card4",                 # Card network (visa, mastercard, etc.)
+        },
+        "extra_mobile_columns": {
+            "device_os": "DeviceType",           # mobile/desktop from identity file
+            "screen": "DeviceInfo",              # Device model/OS from identity file
+            "ip_address": "id_30",               # OS version from identity file
+        },
+        "extra_webhook_columns": {
+            "provider": "P_emaildomain",         # Purchaser email domain
+        },
+        # Columns to pass through as-is for richer signal
+        "passthrough_api": ["dist1", "P_emaildomain", "R_emaildomain", "card6"],
+        "passthrough_db": ["card2", "card3", "card5", "D1", "D2", "D3"],
+        "passthrough_mobile": ["id_31", "id_33"],
+        "passthrough_webhooks": ["C1", "C2", "C3", "C4", "C5", "C6"],
+    },
     "elliptic": {
         "description": "Elliptic Bitcoin — crypto laundering, mixer detection",
         "file_glob": "elliptic_txs_features.csv",
@@ -205,7 +249,7 @@ class DatasetTransformer:
         self.base_time = pd.Timestamp("2026-03-01")
 
     def load(self) -> pd.DataFrame:
-        """Load the raw CSV."""
+        """Load the raw CSV. Handles multi-file datasets (e.g., IEEE-CIS transaction + identity)."""
         data_dir = DATASETS_DIR / self.name
         candidates = sorted(data_dir.glob(self.config["file_glob"]), key=lambda p: p.stat().st_size, reverse=True)
         if not candidates:
@@ -217,6 +261,21 @@ class DatasetTransformer:
         print(f"[*] Loading {path.name} ({path.stat().st_size / 1024 / 1024:.1f} MB)...")
         df = pd.read_csv(path)
         print(f"    {len(df):,} rows, {len(df.columns)} columns")
+
+        # Join with identity file if specified (IEEE-CIS has transaction + identity)
+        identity_file = self.config.get("identity_file")
+        if identity_file:
+            id_path = data_dir / identity_file
+            if id_path.exists():
+                print(f"[*] Loading identity file {identity_file}...")
+                df_id = pd.read_csv(id_path)
+                print(f"    {len(df_id):,} rows, {len(df_id.columns)} columns")
+                # Join on TransactionID
+                join_col = "TransactionID"
+                if join_col in df.columns and join_col in df_id.columns:
+                    df = df.merge(df_id, on=join_col, how="left")
+                    print(f"    Joined: {len(df):,} rows, {len(df.columns)} columns")
+
         return df
 
     def transform(self, df: pd.DataFrame) -> dict:
@@ -394,7 +453,7 @@ class DatasetTransformer:
         extras = self.config.get("extra_api_columns", {})
         ip_address = self._resolve_extra(df, extras.get("ip_address"), "0.0.0.0")
 
-        return pd.DataFrame({
+        result = pd.DataFrame({
             "source": "api_gateway",
             "timestamp": df["_timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S"),
             "request_id": [f"REQ-{i:08x}" for i in range(n)],
@@ -410,6 +469,7 @@ class DatasetTransformer:
             "amount": df["_amount"],
             "currency": "USD",
         })
+        return self._add_passthrough(result, df, "passthrough_api")
 
     def _build_db(self, df: pd.DataFrame, fraud_mask: pd.Series) -> pd.DataFrame:
         """Ledger DB — uses real balance data when available."""
@@ -438,7 +498,7 @@ class DatasetTransformer:
         extras = self.config.get("extra_db_columns", {})
         provider = self._resolve_extra(df, extras.get("provider"), "unknown")
 
-        return pd.DataFrame({
+        result = pd.DataFrame({
             "source": "ledger_db_commits",
             "timestamp": (df["_timestamp"] + pd.Timedelta(seconds=1)).dt.strftime("%Y-%m-%dT%H:%M:%S"),
             "commit_id": [f"CMT-{i:08x}" for i in range(n)],
@@ -452,6 +512,7 @@ class DatasetTransformer:
             "provider": provider,
             "idempotency_key": [f"IDEM-{i:08x}" for i in range(n)],
         })
+        return self._add_passthrough(result, df, "passthrough_db")
 
     def _build_mobile(self, df: pd.DataFrame, fraud_mask: pd.Series) -> pd.DataFrame:
         """Mobile events — one event per transaction. Uses real data where available."""
@@ -477,7 +538,7 @@ class DatasetTransformer:
         screen = self._resolve_extra(df, extras.get("screen"), "transaction")
         ip_address = self._resolve_extra(df, extras.get("ip_address"), "0.0.0.0")
 
-        return pd.DataFrame({
+        result = pd.DataFrame({
             "source": "mobile_client_errors",
             "timestamp": df["_timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S"),
             "event_id": [f"EVT-{i:08x}" for i in range(n)],
@@ -491,6 +552,7 @@ class DatasetTransformer:
             "screen": screen,
             "ip_address": ip_address,
         })
+        return self._add_passthrough(result, df, "passthrough_mobile")
 
     def _build_webhooks(self, df: pd.DataFrame, fraud_mask: pd.Series) -> pd.DataFrame:
         """Webhook events — one per transaction. Uses real data where available."""
@@ -501,7 +563,7 @@ class DatasetTransformer:
         provider = self._resolve_extra(df, extras.get("provider"), "unknown")
         ip_address = self._resolve_extra(df, extras.get("ip_address"), "0.0.0.0")
 
-        return pd.DataFrame({
+        result = pd.DataFrame({
             "source": "payment_webhooks",
             "timestamp": (df["_timestamp"] + pd.Timedelta(seconds=5)).dt.strftime("%Y-%m-%dT%H:%M:%S"),
             "webhook_id": [f"WH-{i:08x}" for i in range(n)],
@@ -515,6 +577,15 @@ class DatasetTransformer:
             "delivery_attempt": 1,
             "latency_ms": 100,
         })
+        return self._add_passthrough(result, df, "passthrough_webhooks")
+
+    def _add_passthrough(self, result: pd.DataFrame, df: pd.DataFrame, config_key: str) -> pd.DataFrame:
+        """Add passthrough columns from raw data to a built DataFrame."""
+        cols = self.config.get(config_key, [])
+        for col in cols:
+            if col in df.columns:
+                result[col] = df[col].values
+        return result
 
     def _resolve_extra(self, df: pd.DataFrame, spec: str, default: str) -> pd.Series:
         """Resolve an extra column spec. Spec can be a single column name
@@ -532,7 +603,7 @@ class DatasetTransformer:
             return df[available[0]].astype(str).fillna(default)
 
         # Concatenate multiple columns
-        return df[available].astype(str).apply(lambda row: ",".join(row), axis=1)
+        return df[available].fillna("").astype(str).apply(lambda row: ",".join(row), axis=1)
 
 
 # ===========================

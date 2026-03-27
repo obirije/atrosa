@@ -34,6 +34,7 @@ ALLOWED_MODULES = frozenset({
     "datetime",
     "hashlib",
     "pandas",
+    "numpy",
     "ingest",
     # Standard library safe modules
     "functools",
