@@ -536,17 +536,89 @@ Examples:
         default=None,
         help="Path to data directory (overrides default data/ for test runs)",
     )
+
+    # --- Connector options ---
+    parser.add_argument(
+        "--source",
+        choices=["csv", "stripe", "airweave"],
+        default=None,
+        help="Data source connector (csv, stripe, airweave). Pulls data before hunting.",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key for the data source (e.g. Stripe secret key)",
+    )
+    parser.add_argument(
+        "--collection",
+        default=None,
+        help="Airweave collection ID (used with --source airweave)",
+    )
+    parser.add_argument(
+        "--airweave-url",
+        default=None,
+        help="Airweave server URL (default: http://localhost:8080)",
+    )
     return parser.parse_args()
+
+
+def _run_connector(args) -> Optional[str]:
+    """Run the specified connector and return the output data directory."""
+    if not args.source:
+        return None
+
+    output_dir = Path(f"data/connector_{args.source}")
+
+    if args.source == "csv":
+        if not args.data_dir:
+            print("[!] --data-dir is required with --source csv")
+            sys.exit(1)
+        from connectors.csv_import import CSVConnector
+        connector = CSVConnector(data_dir=args.data_dir)
+
+    elif args.source == "stripe":
+        if not args.api_key:
+            api_key = os.environ.get("STRIPE_API_KEY")
+            if not api_key:
+                print("[!] --api-key or STRIPE_API_KEY env var required with --source stripe")
+                sys.exit(1)
+        else:
+            api_key = args.api_key
+        from connectors.stripe import StripeConnector
+        connector = StripeConnector(api_key=api_key)
+
+    elif args.source == "airweave":
+        from connectors.airweave_adapter import AirweaveAdapter
+        connector = AirweaveAdapter(
+            url=args.airweave_url,
+            api_key=args.api_key,
+            collection=args.collection,
+        )
+        if not connector.is_available():
+            print(f"[!] Airweave not reachable at {connector.url}")
+            print(f"    Start Airweave or use a different source (--source csv, --source stripe)")
+            sys.exit(1)
+
+    else:
+        return None
+
+    result = connector.run()
+    result.save(str(output_dir))
+    return str(output_dir.resolve())
 
 
 if __name__ == "__main__":
     args = parse_args()
     HUNT_PROMPT_PATH = Path(args.hunt_prompt)
 
+    # Run connector if specified — pulls data before hunting
+    connector_dir = _run_connector(args)
+    data_dir = connector_dir or args.data_dir
+
     # Override data directory if specified (for testrun pipeline).
     # Set as env var so detect.py subprocess inherits it via ingest.DATA_DIR.
-    if args.data_dir:
-        os.environ["ATROSA_DATA_DIR"] = str(Path(args.data_dir).resolve())
+    if data_dir:
+        os.environ["ATROSA_DATA_DIR"] = str(Path(data_dir).resolve())
 
     success = run_hunt(
         provider_name=args.provider,
