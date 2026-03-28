@@ -35,6 +35,11 @@ class LLMProvider(ABC):
         """Make the actual API call. Returns assistant text."""
         ...
 
+    def reset(self):
+        """Clear conversation history. Used to prevent context saturation
+        in long-running autoresearch loops (Karpathy pattern: keep context lean)."""
+        self.messages = []
+
     def chat(self, user_message: str) -> str:
         """Send a message and get a response. Handles retry."""
         self.messages.append({"role": "user", "content": user_message})

@@ -56,6 +56,11 @@ _production_scorer = None
 class HunterLLM:
     """Manages conversation with the Hunter LLM agent via any provider."""
 
+    # Reset conversation every N iterations to prevent context saturation.
+    # After reset, the LLM gets a self-contained context with schema + results
+    # table + best code — no stale conversation history.
+    RESET_EVERY = 5
+
     def __init__(self, provider_name: str = "anthropic", model: str = None, base_url: str = None):
         self.system_prompt = HUNT_PROMPT_PATH.read_text()
         self.provider = create_provider(
@@ -64,9 +69,21 @@ class HunterLLM:
             model=model,
             base_url=base_url,
         )
+        self._call_count = 0
+
+    def reset(self):
+        """Reset conversation history to prevent context saturation."""
+        self.provider.reset()
+        self._call_count = 0
 
     def get_detection_code(self, context: str) -> str:
         """Send context to LLM and get back a rewritten detect.py."""
+        self._call_count += 1
+
+        # Reset periodically to keep context lean (Karpathy: stdout > run.log)
+        if self._call_count > 1 and self._call_count % self.RESET_EVERY == 1:
+            self.reset()
+
         assistant_text = self.provider.chat(context)
 
         # Extract Python code from the response
@@ -382,6 +399,15 @@ if __name__ == "__main__":
 
         # Include experiment history
         parts.append(_build_history_context())
+
+        # After a conversation reset, include schema context so the message is self-contained
+        # (the LLM has no memory of prior messages after reset)
+        if (iteration % HunterLLM.RESET_EVERY) == 1 and iteration > 1:
+            parts.append("\n## CONTEXT (conversation was reset to save memory)")
+            parts.append("Dataset schema:\n" + "\n".join(schema_info))
+            parts.append(f"Total events: {total_events}")
+            parts.append(f"\nUse `harness = ingest.setup()` to load data. Template:")
+            parts.append(f"```python\n{detect_template}```")
 
         # Karpathy-style encouragement when stuck
         if iteration > 5 and best_score < 20:
