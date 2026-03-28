@@ -93,22 +93,30 @@ Connectors pull data, auto-discover the schema, transform to ATROSA's 4-DataFram
 
 ## How the Hunter Works
 
+Based on [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) pattern:
+
 ```
-hunt.md (threat hypothesis)
+Baseline run (establish reference score)
     ↓
-LLM generates detect.py  ←──── feedback loop
+LLM generates detect.py  ←──── feedback loop (with full experiment history)
     ↓                              ↑
 AST validation (security)          │
     ↓                              │
-Execute in subprocess              │
+Execute in subprocess (5 min)      │
     ↓                              │
 Score (SNR 0-100) ─── < 100 ──────┘
+    │                   │
+    │                   └── Track best-so-far, reset context every 5 iterations
     │
     └── = 100 → GRADUATE RULE → rules/*.py → Sentinel enforces
 ```
 
-- Score = 0: crashed, flagged nothing, or >1% of traffic (too noisy)
-- Score = 100: found all anomalies with zero false positives
+- Up to 50 iterations (unlimited for local models: `--max-iterations 0`)
+- 5-minute execution timeout per iteration (matches Karpathy's TIME_BUDGET)
+- Cumulative experiment history — LLM sees all prior attempts, scores, and approaches
+- Best-so-far tracking — regressed iterations are flagged, best code is saved
+- Rich feedback — precision/recall breakdown, not just a score number
+- Conversation reset every 5 iterations to prevent context saturation
 - Graduated rules are deterministic Python — no LLM at runtime
 
 ## Data Source Tiers

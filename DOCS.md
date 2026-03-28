@@ -305,33 +305,54 @@ class PaystackConnector(BaseConnector):
 
 ## 6. The Hunter
 
-The Hunter is the core autoresearch loop. It uses an LLM to generate detection scripts, tests them, and iterates based on scoring feedback.
+The Hunter is the core autoresearch loop, based on [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) pattern. It uses an LLM to generate detection scripts, tests them, and iterates based on scoring feedback.
 
 ### How It Works
 
 ```
-hunt.md (threat hypothesis or generic prompt)
+Baseline run (establish reference score = 0)
     ↓
-LLM generates detect.py  ←──── feedback loop
+LLM generates detect.py  ←──── rich feedback + cumulative experiment history
     ↓                              ↑
 AST validation (security)          │
     ↓                              │
-Execute in subprocess (30s)        │
+Execute in subprocess (5 min)      │
     ↓                              │
 Score (SNR 0-100) ─── < 100 ──────┘
+    │                   │
+    │                   └── Track best-so-far, reset context every 5 iterations
     │
     └── = 100 → GRADUATE RULE → rules/*.py → Sentinel
 ```
 
 ### The Iteration Loop
 
-1. The orchestrator sends the hunt prompt + data schema + prior feedback to the LLM
-2. The LLM returns a complete `detect.py` in a fenced code block
-3. `code_validator.py` parses the code via AST — rejects dangerous constructs
-4. The code is executed in an isolated subprocess with a timeout
-5. Results are scored against ground truth (dev) or multi-strategy scoring (production)
-6. Score + feedback are sent back to the LLM for the next iteration
-7. On score = 100 (dev) or >= 70 (production), the rule graduates
+1. **Baseline**: Run the empty template to establish reference score (always 0)
+2. The orchestrator sends the hunt prompt + data schema + experiment history to the LLM
+3. The LLM returns a complete `detect.py` in a fenced code block
+4. `code_validator.py` parses the code via AST — rejects dangerous constructs
+5. The code is executed in an isolated subprocess with a 5-minute timeout
+6. Results are scored against ground truth (dev) or multi-strategy scoring (production)
+7. Score + rich feedback (precision, recall, comparison to best) are sent back
+8. The experiment is logged to `results.tsv` — the LLM sees ALL prior attempts
+9. If score regressed from best, the LLM is told to build on what worked
+10. Every 5 iterations, conversation history is reset to prevent context saturation
+11. On score = 100 (dev) or >= 70 (production), the rule graduates
+12. If max iterations reached, best detection code is saved to `logs/best_detect.py`
+
+### Karpathy Autoresearch Alignment
+
+| Karpathy Pattern | ATROSA Implementation |
+|---|---|
+| `LOOP FOREVER, NEVER STOP` | 50 iterations default, `--max-iterations 0` for unlimited |
+| `TIME_BUDGET = 300` (5 min) | `DETECT_TIMEOUT = 300` seconds |
+| `results.tsv` cumulative history | Experiment history table sent with every feedback message |
+| Baseline first | Empty template run before first LLM iteration |
+| `git reset` on regression | Best-so-far tracking — LLM told when it regressed |
+| `stdout > run.log` (lean context) | Conversation reset every 5 iterations |
+| "Think harder" when stuck | Explicit encouragement after 5+ low-scoring iterations |
+| Single file scope (`train.py`) | Single file scope (`detect.py`) |
+| Single scalar metric (`val_bpb`) | Single scalar metric (SNR score 0-100) |
 
 ### Hunt Prompts
 
@@ -381,7 +402,7 @@ atrosa hunt --data-dir testrun/transformed/ieee_cis
 | `--provider` | LLM provider (anthropic, openai, gemini, openrouter, local) | anthropic |
 | `--model` | Model override | Provider default |
 | `--base-url` | Custom API endpoint (local models) | Provider default |
-| `--max-iterations` | Max autoresearch iterations | 10 |
+| `--max-iterations` | Max autoresearch iterations (0 = unlimited) | 50 |
 | `--hunt-prompt` | Path to hunt prompt file | hunt.md |
 | `--hunt-id` | Hunt category from catalog | None |
 | `--data-dir` | Data directory override | data/ |
@@ -826,36 +847,50 @@ atrosa hunt --provider local --base-url http://localhost:8000/v1
 
 ### Cost Estimate Per Hunt
 
-~3,000-4,000 input tokens + ~1,000-2,000 output tokens per iteration. Typical hunt: 3-10 iterations.
+~3,000-4,000 input tokens + ~1,000-2,000 output tokens per iteration. With 20 iterations: ~$0.30 (Anthropic), ~$0.02 (Gemini Flash), free (local).
 
 ---
 
 ## 18. Test Run Results
 
-ATROSA was tested against 3 public fraud datasets plus the built-in synthetic telemetry.
+ATROSA was tested against 3 public fraud datasets plus the built-in synthetic telemetry. The Hunter loop was improved based on [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) parameters across these runs.
 
 ### Results Summary
 
-| Dataset | Type | Rows | Best Score | Fraud Found | Key Finding |
-|---------|------|------|-----------|-------------|-------------|
-| **mock_telemetry** | Synthetic (purpose-built) | 26K | **100/100** | 3/3 (100%) | Architecture proven — cross-source signals work |
-| **IEEE-CIS** | **Real** (Vesta e-commerce) | 590K | **18/100** | 420 users (24%) | Best on real data — scores improve with richer features |
-| **Sparkov** | Synthetic (credit card) | 1.3M | 12/100 | 56 users | Multi-dim data helps, but no balances |
-| **PaySim** | Synthetic (mobile money) | 6.3M | 2/100 | 25 txns | Single-source signal insufficient for cross-correlation |
+| Dataset | Type | Rows | Best Score | Fraud Found | Iterations | Key Finding |
+|---------|------|------|-----------|-------------|-----------|-------------|
+| **mock_telemetry** | Synthetic (purpose-built) | 26K | **100/100** | 3/3 (100%) | 1 | Architecture proven — cross-source signals work |
+| **IEEE-CIS** | **Real** (Vesta e-commerce) | 590K | **18/100** | 420 users (24%) | 20 | Best on real data — scores improve with richer features |
+| **Sparkov** | Synthetic (credit card) | 1.3M | 12/100 | 56 users | 10 | Multi-dim data helps, but no balances |
+| **PaySim** | Synthetic (mobile money) | 6.3M | 2/100 | 25 txns | 10 | Single-source signal insufficient for cross-correlation |
+
+### Score Progression (IEEE-CIS, 20 iterations)
+
+```
+Iter:  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20
+Score: 0  0  0  8  0  0  8 11  -  -  -  -  -  -  -  - 11  - 5  -
+```
+
+Iterations marked `-` failed due to context saturation (LLM returned text instead of code) — fixed by conversation reset every 5 iterations.
 
 ### Key Insight
 
 Detection quality scales directly with data richness across sources. ATROSA's cross-correlation architecture works when fraud leaves traces in multiple systems simultaneously — which real attacks do.
 
-### Infrastructure Bugs Found During Testing
+### Bugs Found and Fixed During Testing
 
 | Bug | Impact | Fix |
 |---|---|---|
-| Independent sampling per DataFrame | Transaction IDs didn't overlap across sources | Sample at transaction level before building DataFrames |
-| `detect.py` subprocess didn't inherit `--data-dir` | Loaded wrong data directory | Use `ATROSA_DATA_DIR` env var |
+| 10 iteration cap | Hunter still improving at iteration 10 | Increased to 50 (0=unlimited) |
+| 30s execution timeout | Complex scripts on 50K rows timed out | Increased to 300s (5 min) |
+| No experiment history | LLM couldn't learn from prior attempts | Added cumulative results table |
+| No baseline run | No reference score to improve against | Run empty template first |
+| Context saturation after 8 iterations | LLM stopped generating code blocks | Reset conversation every 5 iterations |
 | Scorer hints hardcoded for webhook desync | Misled Hunter on non-mock datasets | Made hints generic |
 | Code validator blocked `pandas.rename()` | False positive on legitimate operations | Removed from blocklist |
 | Code validator blocked `numpy` | Hunter couldn't do statistical analysis | Added to allowlist |
+| Independent sampling per DataFrame | Transaction IDs didn't overlap across sources | Sample at transaction level |
+| `detect.py` subprocess didn't inherit `--data-dir` | Loaded wrong data directory | Use `ATROSA_DATA_DIR` env var |
 
 ### Running Tests
 
