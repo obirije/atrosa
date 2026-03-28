@@ -38,12 +38,13 @@ from typing import Optional
 from providers import create_provider, DEFAULT_MODELS, ENV_KEYS
 
 # --- Config ---
-MAX_ITERATIONS = 10
-DETECT_TIMEOUT = 30  # seconds
+MAX_ITERATIONS = 50   # Karpathy: unlimited. We cap at 50 for paid APIs, unlimited for local.
+DETECT_TIMEOUT = 300  # seconds (Karpathy: 300s budget, 600s hard kill)
 HUNT_PROMPT_PATH = Path("hunt.md")
 DETECT_PATH = Path("detect.py")
 RULES_PATH = Path("active_rules.json")
 LOG_DIR = Path("logs")
+RESULTS_TSV = Path("results.tsv")  # Cumulative experiment history (like Karpathy's results.tsv)
 
 # Production scoring + audit (imported lazily to avoid circular deps)
 _audit_trail = None
@@ -304,9 +305,129 @@ if __name__ == "__main__":
     )
 
     LOG_DIR.mkdir(exist_ok=True)
-    feedback_context = initial_context  # fallback if iteration 1 fails
+    Path("rules").mkdir(exist_ok=True)
 
-    # --- Iteration Loop ---
+    # --- Experiment History (like Karpathy's results.tsv) ---
+    # Cumulative log of ALL iterations — the LLM sees full history each time
+    experiment_history = []
+    best_score = -1
+    best_code = None
+    best_iteration = 0
+
+    # Initialize results.tsv
+    results_path = LOG_DIR / "results.tsv"
+    with open(results_path, "w") as f:
+        f.write("iteration\tscore\tflagged_tx\tflagged_users\tstatus\tdescription\n")
+
+    def _append_result(iteration, score, flagged_tx, flagged_users, status, description):
+        with open(results_path, "a") as f:
+            f.write(f"{iteration}\t{score}\t{flagged_tx}\t{flagged_users}\t{status}\t{description}\n")
+
+    def _build_history_context():
+        """Build cumulative experiment history for the LLM — like Karpathy's results.tsv."""
+        if not experiment_history:
+            return ""
+        lines = ["\n## EXPERIMENT HISTORY (all prior attempts)"]
+        lines.append("| Iter | Score | Flagged TX | Flagged Users | Status | Approach |")
+        lines.append("|------|-------|-----------|--------------|--------|----------|")
+        for exp in experiment_history:
+            lines.append(
+                f"| {exp['iteration']} | {exp['score']}/100 | {exp['flagged_tx']} | "
+                f"{exp['flagged_users']} | {exp['status']} | {exp['description'][:60]} |"
+            )
+        if best_score > 0:
+            lines.append(f"\n**BEST SO FAR: iteration {best_iteration}, score {best_score}/100**")
+        return "\n".join(lines)
+
+    def _build_feedback(iteration, score, score_result, flagged_tx, flagged_users, new_code):
+        """Build rich feedback — tells the LLM exactly what worked and what didn't."""
+        nonlocal best_score, best_code, best_iteration
+
+        parts = [f"ITERATION {iteration} RESULT:"]
+        parts.append(f"SNR Score: {score}/100")
+        parts.append(f"Flagged {len(flagged_tx)} transactions, {len(set(flagged_users))} users.")
+
+        # Precision and recall breakdown
+        tp_tx = score_result.get("true_positive_txs", [])
+        tp_users = score_result.get("true_positive_users", [])
+        tx_recall = score_result.get("tx_recall", 0)
+        user_recall = score_result.get("user_recall", 0)
+        tx_precision = score_result.get("tx_precision", 0)
+        user_precision = score_result.get("user_precision", 0)
+
+        if len(flagged_tx) > 0:
+            parts.append(f"Transaction precision: {tx_precision:.1%} ({len(tp_tx)} true positives / {len(flagged_tx)} flagged)")
+            parts.append(f"Transaction recall: {tx_recall:.1%}")
+        if len(flagged_users) > 0:
+            parts.append(f"User precision: {user_precision:.1%} ({len(tp_users)} true positives / {len(set(flagged_users))} flagged)")
+            parts.append(f"User recall: {user_recall:.1%}")
+
+        parts.append(f"\n{score_result['feedback']}")
+
+        # Compare to best
+        if best_score > score and best_score > 0:
+            parts.append(
+                f"\nNOTE: Your best score was {best_score}/100 on iteration {best_iteration}. "
+                f"This iteration scored lower. Consider building on what worked in iteration "
+                f"{best_iteration} rather than trying a completely different approach."
+            )
+        elif score > best_score:
+            parts.append(f"\nNEW BEST SCORE! Previous best was {best_score}/100. Keep refining this approach.")
+
+        # Update best tracker
+        if score > best_score:
+            best_score = score
+            best_code = new_code
+            best_iteration = iteration
+
+        # Include experiment history
+        parts.append(_build_history_context())
+
+        # Karpathy-style encouragement when stuck
+        if iteration > 5 and best_score < 20:
+            parts.append(
+                "\nYou've been iterating for a while with low scores. Think harder:\n"
+                "- Re-examine the sample data for patterns you haven't tried\n"
+                "- Try combining approaches from your best-scoring iterations\n"
+                "- Try a radically different hypothesis about what makes fraud different\n"
+                "- Focus on what the data ACTUALLY contains, not what you expect it to contain"
+            )
+
+        parts.append(
+            "\nReturn the COMPLETE updated detect.py in a Python code block."
+        )
+        return "\n".join(parts)
+
+    # --- Baseline Run (Karpathy: always establish reference first) ---
+    print(f"\n{'─' * 40}")
+    print(f"  BASELINE (establishing reference)")
+    print(f"{'─' * 40}")
+
+    baseline_code = detect_template
+    DETECT_PATH.write_text(baseline_code)
+    baseline_output = run_detect()
+    if baseline_output.get("error"):
+        print(f"[*] Baseline: no detection (empty template) — score 0")
+        baseline_score = 0
+    else:
+        baseline_result = ingest.score_detections(
+            flagged_tx_ids=baseline_output.get("flagged_tx_ids", []),
+            flagged_user_ids=baseline_output.get("flagged_user_ids", []),
+            total_events=total_events,
+            ground_truth=ground_truth,
+        )
+        baseline_score = baseline_result.get("score", 0)
+        print(f"[*] Baseline score: {baseline_score}/100")
+
+    experiment_history.append({
+        "iteration": 0, "score": baseline_score, "flagged_tx": 0,
+        "flagged_users": 0, "status": "baseline", "description": "Empty template — no detection logic",
+    })
+    _append_result(0, baseline_score, 0, 0, "baseline", "Empty template")
+
+    feedback_context = initial_context  # First iteration gets the initial context
+
+    # --- Iteration Loop (Karpathy: LOOP FOREVER — we cap at MAX_ITERATIONS for cost) ---
     for iteration in range(1, MAX_ITERATIONS + 1):
         print(f"\n{'─' * 40}")
         print(f"  ITERATION {iteration}/{MAX_ITERATIONS}")
@@ -318,18 +439,29 @@ if __name__ == "__main__":
             new_code = hunter.get_detection_code(initial_context if iteration == 1 else feedback_context)
         except Exception as e:
             print(f"[!] LLM error: {e}")
+            experiment_history.append({
+                "iteration": iteration, "score": 0, "flagged_tx": 0,
+                "flagged_users": 0, "status": "llm_error", "description": str(e)[:60],
+            })
+            _append_result(iteration, 0, 0, 0, "llm_error", str(e)[:60])
             continue
 
         # Step 2: Validate code safety before writing
         try:
             from code_validator import validate_and_report
             if not validate_and_report(new_code):
+                experiment_history.append({
+                    "iteration": iteration, "score": 0, "flagged_tx": 0,
+                    "flagged_users": 0, "status": "rejected", "description": "Security validation failed",
+                })
+                _append_result(iteration, 0, 0, 0, "rejected", "Security validation failed")
                 feedback_context = (
                     f"ITERATION {iteration} RESULT:\n"
                     f"Your detect.py was REJECTED by the security validator. "
-                    f"Detection scripts may only use: pandas, json, re, datetime, collections, math, sys. "
+                    f"Detection scripts may only use: pandas, numpy, json, re, datetime, collections, math, sys. "
                     f"You MUST NOT use: os, subprocess, socket, urllib, eval, exec, open() for writing, "
                     f"or any network/file-system operations. "
+                    f"\n{_build_history_context()}\n"
                     f"Return the COMPLETE corrected detect.py in a Python code block."
                 )
                 continue
@@ -344,7 +476,7 @@ if __name__ == "__main__":
         log_path = LOG_DIR / f"iteration_{iteration:02d}.py"
         log_path.write_text(new_code)
 
-        # Step 4: Execute detect.py
+        # Step 4: Execute detect.py (300s timeout — Karpathy uses 5 min)
         print("[*] Executing detect.py...")
         t0 = time.time()
         detection_output = run_detect()
@@ -368,25 +500,35 @@ if __name__ == "__main__":
                 if tel_requests:
                     print(f"[*] Telemetry Engineer created {len(tel_requests)} observability request(s)")
             except Exception:
-                pass  # Telemetry Engineer is optional
+                pass
+
+            # Truncate stderr to avoid context pollution (Karpathy: stdout > run.log)
+            stderr_snippet = detection_output.get("stderr", "")[:500]
+            experiment_history.append({
+                "iteration": iteration, "score": 0, "flagged_tx": 0,
+                "flagged_users": 0, "status": "crashed",
+                "description": detection_output["error"][:60],
+            })
+            _append_result(iteration, 0, 0, 0, "crashed", detection_output["error"][:60])
 
             feedback_context = (
                 f"ITERATION {iteration} RESULT:\n"
                 f"Your detect.py CRASHED with error:\n{detection_output['error']}\n"
             )
-            if "stderr" in detection_output:
-                feedback_context += f"Stderr output:\n{detection_output['stderr'][:1000]}\n"
+            if stderr_snippet:
+                feedback_context += f"Stderr (truncated):\n{stderr_snippet}\n"
             feedback_context += (
-                "\nFix the error and try again. REMEMBER: You MUST use `harness = ingest.setup()` to load data. "
-                "Do NOT import data any other way. Return the COMPLETE corrected detect.py in a Python code block."
+                "\nFix the error and try again. Use `harness = ingest.setup()` to load data."
             )
+            feedback_context += f"\n{_build_history_context()}"
+            feedback_context += "\nReturn the COMPLETE corrected detect.py in a Python code block."
             continue
 
-        # Step 5: Score the detection
+        # Step 6: Score the detection
         flagged_tx = detection_output.get("flagged_tx_ids", [])
         flagged_users = detection_output.get("flagged_user_ids", [])
 
-        print(f"[*] Flagged: {len(flagged_tx)} transactions, {len(flagged_users)} users")
+        print(f"[*] Flagged: {len(flagged_tx)} transactions, {len(set(flagged_users))} users")
 
         # Use production scorer if available, otherwise use ground truth
         if _production_scorer and production:
@@ -410,14 +552,27 @@ if __name__ == "__main__":
         print(f"[*] SNR Score: {score}/100")
         print(f"    {score_result['feedback']}")
 
+        # Describe the approach (for history)
+        approach_desc = f"Score {score}, flagged {len(flagged_tx)} tx / {len(set(flagged_users))} users"
+        status = "kept" if score > best_score else "discarded"
+
+        experiment_history.append({
+            "iteration": iteration, "score": score,
+            "flagged_tx": len(flagged_tx), "flagged_users": len(set(flagged_users)),
+            "status": status, "description": approach_desc,
+        })
+        _append_result(iteration, score, len(flagged_tx), len(set(flagged_users)), status, approach_desc)
+
         # Log score
         score_log = {
             "iteration": iteration,
             "score": score,
             "flagged_tx": len(flagged_tx),
-            "flagged_users": len(flagged_users),
+            "flagged_users": len(set(flagged_users)),
             "elapsed_s": elapsed,
             "feedback": score_result["feedback"],
+            "best_score": max(best_score, score),
+            "best_iteration": best_iteration if score <= best_score else iteration,
         }
         with open(LOG_DIR / f"score_{iteration:02d}.json", "w") as f:
             json.dump(score_log, f, indent=2)
@@ -430,12 +585,12 @@ if __name__ == "__main__":
                     feedback=score_result["feedback"],
                     execution_time_s=elapsed,
                     flagged_tx_count=len(flagged_tx),
-                    flagged_user_count=len(flagged_users),
+                    flagged_user_count=len(set(flagged_users)),
                 )
             except Exception:
                 pass
 
-        # Step 6: Check for graduation
+        # Step 7: Check for graduation
         graduation_score = 100 if not production else score_result.get("graduation_threshold", 70)
         should_graduate = score >= graduation_score if production else score == 100
         if should_graduate:
@@ -447,25 +602,29 @@ if __name__ == "__main__":
                 except Exception:
                     pass
             print(f"\n[+] Hunt complete. Rule {rule_id} is now active.")
+            print(f"    Total iterations: {iteration}")
+            print(f"    Best score progression: {[e['score'] for e in experiment_history]}")
             return True
 
-        # Step 7: Build feedback for next iteration
-        feedback_context = (
-            f"ITERATION {iteration} RESULT:\n"
-            f"SNR Score: {score}/100\n"
-            f"Flagged {len(flagged_tx)} transactions, {len(flagged_users)} users.\n"
-            f"Feedback: {score_result['feedback']}\n"
-        )
-        if score_result.get("true_positive_txs"):
-            feedback_context += f"Correctly identified TXs: {score_result['true_positive_txs']}\n"
-        if score_result.get("true_positive_users"):
-            feedback_context += f"Correctly identified users: {score_result['true_positive_users']}\n"
-        feedback_context += (
-            "\nImprove your detection logic based on this feedback. "
-            "Return the COMPLETE updated detect.py in a Python code block."
+        # Step 8: Build rich feedback for next iteration (Karpathy: cumulative history + exact metrics)
+        feedback_context = _build_feedback(
+            iteration, score, score_result, flagged_tx, flagged_users, new_code
         )
 
-    print(f"\n[X] Max iterations ({MAX_ITERATIONS}) reached without perfect score.")
+        # Karpathy: if score regressed, revert to best code
+        # (We don't revert detect.py — we tell the LLM about the regression in feedback)
+
+    # End of loop — report final status
+    print(f"\n[X] Max iterations ({MAX_ITERATIONS}) reached without graduation.")
+    print(f"    Best score: {best_score}/100 on iteration {best_iteration}")
+    print(f"    Score progression: {[e['score'] for e in experiment_history]}")
+
+    # Save best code even if not graduated
+    if best_code and best_score > 0:
+        best_path = LOG_DIR / "best_detect.py"
+        best_path.write_text(best_code)
+        print(f"    Best detection saved to {best_path}")
+
     return False
 
 
@@ -509,7 +668,7 @@ Examples:
         "--max-iterations", "-n",
         type=int,
         default=MAX_ITERATIONS,
-        help=f"Max hunt iterations (default: {MAX_ITERATIONS})",
+        help=f"Max hunt iterations (default: {MAX_ITERATIONS}). Use 0 for unlimited (local models).",
     )
     parser.add_argument(
         "--hunt-prompt",
@@ -610,6 +769,12 @@ def _run_connector(args) -> Optional[str]:
 if __name__ == "__main__":
     args = parse_args()
     HUNT_PROMPT_PATH = Path(args.hunt_prompt)
+
+    # Handle unlimited iterations (--max-iterations 0)
+    if args.max_iterations == 0:
+        MAX_ITERATIONS = 999999  # Effectively unlimited (Karpathy: "LOOP FOREVER")
+    else:
+        MAX_ITERATIONS = args.max_iterations
 
     # Run connector if specified — pulls data before hunting
     connector_dir = _run_connector(args)
