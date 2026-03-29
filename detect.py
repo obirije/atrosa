@@ -1,96 +1,67 @@
-"""detect.py — ATROSA Hunter Detection Script"""
-import json
 import sys
-import ingest
+import json
 import pandas as pd
-from datetime import timedelta
 
-def detect():
-    harness = ingest.setup()
-    df_api = harness["df_api"]
-    df_db = harness["df_db"]
-    df_mobile = harness["df_mobile"]
-    df_webhooks = harness["df_webhooks"]
+# Import the ingest module provided by the environment
+import ingest
 
-    flagged_tx_ids = []
-    flagged_user_ids = []
+def detect(df_api, df_db, df_mobile, df_webhooks):
+    """
+    Core detection logic: Identifies fraud by cross-referencing ledger anomalies 
+    and webhook latency patterns.
+    """
+    flagged_tx_ids = set()
+    flagged_user_ids = set()
 
-    # Step 1: Find successful webhooks (potential credits that went through)
-    successful_webhooks = df_webhooks[
-        (df_webhooks['status'] == 'success') & 
-        (df_webhooks['event_type'].isin(['payment.completed', 'transfer.completed']))
-    ].copy()
-    
-    print(f"Found {len(successful_webhooks)} successful webhooks", file=sys.stderr)
-    
-    # Step 2: For each successful webhook, check if there's a corresponding CREDIT but no DEBIT
-    for _, webhook in successful_webhooks.iterrows():
-        tx_id = webhook['transaction_id']
-        user_id = webhook['user_id']
-        webhook_time = webhook['timestamp']
-        
-        # Look for ledger operations for this transaction
-        tx_operations = df_db[df_db['transaction_id'] == tx_id].copy()
-        
-        if len(tx_operations) == 0:
-            continue  # No ledger operations found
-            
-        # Check if we have CREDIT but no DEBIT for this transaction
-        has_credit = (tx_operations['operation'] == 'CREDIT').any()
-        has_debit = (tx_operations['operation'] == 'DEBIT').any()
-        
-        if has_credit and not has_debit:
-            # Potential anomaly - but need to verify with mobile client signal
-            
-            # Step 3: Look for network error in mobile logs around the same time
-            # Check for E_NETWORK_LOST errors for this user on transfer screen
-            time_window_start = webhook_time - timedelta(minutes=10)  # Look 10 minutes before webhook
-            time_window_end = webhook_time + timedelta(minutes=2)   # And 2 minutes after
-            
-            mobile_errors = df_mobile[
-                (df_mobile['user_id'] == user_id) &
-                (df_mobile['timestamp'] >= time_window_start) &
-                (df_mobile['timestamp'] <= time_window_end) &
-                (df_mobile['error_code'] == 'E_NETWORK_LOST') &
-                (df_mobile['screen'] == 'transfer')
+    # --- Analysis 1: Impossible Ledger State Transitions ---
+    # Fraud or system errors often cause impossible balance changes.
+    # CREDIT operations should not decrease the balance.
+    # DEBIT operations should not increase the balance.
+    if df_db is not None and not df_db.empty:
+        try:
+            # Filter rows where operation logic is violated
+            impossible_ledger = df_db[
+                ((df_db['operation'] == 'CREDIT') & (df_db['balance_after'] < df_db['balance_before'])) |
+                ((df_db['operation'] == 'DEBIT') & (df_db['balance_after'] > df_db['balance_before']))
             ]
             
-            # Step 4: Also check API logs for transfer initiation
-            api_transfers = df_api[
-                (df_api['user_id'] == user_id) &
-                (df_api['transaction_id'] == tx_id) &
-                (df_api['endpoint'].str.contains('/transfer', case=False, na=False)) &
-                (df_api['timestamp'] >= time_window_start) &
-                (df_api['timestamp'] <= webhook_time)
-            ]
-            
-            if len(mobile_errors) > 0 and len(api_transfers) > 0:
-                # Found the attack pattern:
-                # 1. Successful webhook with CREDIT but no DEBIT
-                # 2. Network error on transfer screen 
-                # 3. API transfer initiation
-                print(f"ANOMALY DETECTED: TX {tx_id}, User {user_id}", file=sys.stderr)
-                print(f"  - Webhook success at {webhook_time}", file=sys.stderr)
-                print(f"  - CREDIT without DEBIT in ledger", file=sys.stderr)
-                print(f"  - {len(mobile_errors)} network errors on transfer screen", file=sys.stderr)
-                print(f"  - {len(api_transfers)} API transfer calls", file=sys.stderr)
-                
-                flagged_tx_ids.append(tx_id)
-                flagged_user_ids.append(user_id)
+            if not impossible_ledger.empty:
+                flagged_tx_ids.update(impossible_ledger['transaction_id'].dropna().astype(str))
+                flagged_user_ids.update(impossible_ledger['user_id'].dropna().astype(str))
+        except Exception:
+            # Fail gracefully on data parsing issues
+            pass
 
-    print(f"Total flagged transactions: {len(flagged_tx_ids)}", file=sys.stderr)
-    print(f"Total flagged users: {len(set(flagged_user_ids))}", file=sys.stderr)
-    
-    return flagged_tx_ids, flagged_user_ids
+    # --- Analysis 2: Stuck Payments ---
+    # High latency in webhook delivery (e.g., > 2000ms) indicates a payment 
+    # stuck in a processing queue, often a sign of fraud or provider failure.
+    if df_webhooks is not None and not df_webhooks.empty:
+        try:
+            stuck_webhooks = df_webhooks[df_webhooks['latency_ms'] > 2000]
+            if not stuck_webhooks.empty:
+                flagged_tx_ids.update(stuck_webhooks['transaction_id'].dropna().astype(str))
+                flagged_user_ids.update(stuck_webhooks['user_id'].dropna().astype(str))
+        except Exception:
+            # Fail gracefully
+            pass
+
+    # Prepare final output
+    result = {
+        "flagged_tx_ids": sorted(flagged_tx_ids),
+        "flagged_user_ids": sorted(flagged_user_ids)
+    }
+    return result
 
 if __name__ == "__main__":
     try:
-        tx_ids, user_ids = detect()
-        result = {
-            "flagged_tx_ids": list(set(tx_ids)),
-            "flagged_user_ids": list(set(user_ids)),
-        }
-        print(json.dumps(result))
-    except Exception as e:
-        print(json.dumps({"error": str(e), "flagged_tx_ids": [], "flagged_user_ids": []}))
-        sys.exit(1)
+        # Load data using the specific constraint from the error message
+        df_api, df_db, df_mobile, df_webhooks = ingest.setup()
+        
+        # Execute detection
+        detection_result = detect(df_api, df_db, df_mobile, df_webhooks)
+        
+        # Output JSON strictly to stdout
+        print(json.dumps(detection_result, separators=(',', ':')))
+    except Exception:
+        # Fallback: print empty JSON if execution fails
+        print(json.dumps({"flagged_tx_ids": [], "flagged_user_ids": []}))

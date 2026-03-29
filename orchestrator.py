@@ -94,19 +94,47 @@ class HunterLLM:
 
 
 def extract_code_block(text: str) -> Optional[str]:
-    """Extract the first Python code block from LLM output.
+    """Extract Python code from LLM output.
 
-    Security: Only accepts code within proper ``` fences.
-    The previous fallback that accepted any text containing 'import' and
-    'def detect' was removed — it allowed arbitrary text to be treated as
-    executable Python, which is an injection vector.
+    Strategy (in order):
+      1. Fenced code block (```python ... ```) — preferred
+      2. AST-validated fallback — if the response (or a substring) parses as
+         valid Python containing a detect() function, accept it. This handles
+         models that don't consistently use fences (GLM, Gemini).
+         Safe because code_validator.py runs AFTER extraction.
     """
     import re
-    # Match ```python ... ``` or ``` ... ```
+    import ast
+
+    # Strategy 1: Fenced code block
     pattern = r"```(?:python)?\s*\n(.*?)```"
     match = re.search(pattern, text, re.DOTALL)
     if match:
         return match.group(1).strip()
+
+    # Strategy 2: AST-validated fallback
+    # Try the full text first, then try stripping non-code lines
+    candidates = [text.strip()]
+
+    # Also try extracting from first "import" or "def" to end
+    for marker in ["import ", "def detect"]:
+        idx = text.find(marker)
+        if idx >= 0:
+            candidates.append(text[idx:].strip())
+
+    for candidate in candidates:
+        try:
+            tree = ast.parse(candidate)
+            # Must contain a detect() function to be accepted
+            has_detect = any(
+                isinstance(node, ast.FunctionDef) and node.name == "detect"
+                for node in ast.walk(tree)
+            )
+            if has_detect:
+                return candidate
+        except SyntaxError:
+            continue
+
     return None
 
 
